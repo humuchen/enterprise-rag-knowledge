@@ -1,5 +1,6 @@
 // src/chunker.ts
 import crypto from 'crypto';
+import { buildSearchText } from './tokenize';
 
 const SEPARATORS: Array<{ pattern: RegExp; label: string }> = [
   { pattern: /^#{1,6}\s/m, label: 'header' },
@@ -93,6 +94,7 @@ export class TextSplitter {
 
   private _preClean(text: string): string {
     return text
+      // eslint-disable-next-line no-control-regex
       .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, '')
       .replace(/[ \t]+/g, ' ')
       .replace(/\n{3,}/g, '\n\n')
@@ -105,6 +107,7 @@ export const computeHash = (text: string): string =>
 
 export interface ChunkDict {
   content: string;
+  searchText: string;
   hash: string;
   source: string;
   title: string;
@@ -128,6 +131,7 @@ export function chunkDocument(
     seen.add(h);
     result.push({
       content: chunkText,
+      searchText: buildSearchText(chunkText),
       hash: h,
       source,
       title: title || source,

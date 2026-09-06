@@ -101,7 +101,7 @@ const PARSERS: Record<string, (f: string) => Promise<string>> = {
   '.htm': parseHtml,
 };
 
-export async function parseDocument(filePath: string, scrub: boolean = true): Promise<{ text: string; lang: string }> {
+export async function parseDocument(filePath: string, scrub: boolean = false): Promise<{ text: string; lang: string }> {
   const ext = path.extname(filePath).toLowerCase();
   const parser = PARSERS[ext];
 

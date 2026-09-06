@@ -11,31 +11,37 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 
 -- Chunks with embeddings
+-- hash 只在单个文档内唯一：全局唯一会让不同文档中的相同段落被静默丢弃。
 CREATE TABLE IF NOT EXISTS chunks (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     doc_id      UUID REFERENCES documents(id) ON DELETE CASCADE,
     content     TEXT NOT NULL,
-    hash        TEXT UNIQUE,
+    search_text TEXT,
+    hash        TEXT NOT NULL,
     metadata    JSONB DEFAULT '{}',
     embedding   VECTOR(1024),
     access_tags TEXT[] DEFAULT '{}',
     created_at  TIMESTAMPTZ DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ DEFAULT NOW()
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT chunks_doc_id_hash_key UNIQUE (doc_id, hash)
 );
 
 -- Indexes for performance
-CREATE INDEX IF NOT EXISTS chunks_embedding_idx ON chunks USING ivfflat (embedding vector_ip) WITH (lists = 100);
-CREATE INDEX IF NOT EXISTS chunks_hash_idx ON chunks(hash);
+-- 索引算子必须与查询算子一致：retriever 用 <=> （余弦距离），
+-- 因此这里必须是 vector_cosine_ops，写成 vector_ip 会导致索引失效、全表扫描。
+CREATE INDEX IF NOT EXISTS chunks_embedding_idx ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 CREATE INDEX IF NOT EXISTS chunks_access_tags_idx ON chunks USING GIN (access_tags);
 CREATE INDEX IF NOT EXISTS chunks_doc_id_idx ON chunks(doc_id);
 
 -- Full-text search index (for BM25 hybrid search)
-CREATE INDEX IF NOT EXISTS chunks_fts_idx ON chunks USING GIN (to_tsvector('english', content));
+-- search_text 由应用层生成（中文 bigram，见 src/tokenize.ts）。
+-- 使用 simple 配置：不做词干化，保证入库与查询侧的 token 完全对齐。
+CREATE INDEX IF NOT EXISTS chunks_fts_idx ON chunks USING GIN (to_tsvector('simple', coalesce(search_text, '')));
 
 -- Chat history for context
 CREATE TABLE IF NOT EXISTS chat_history (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    session_id  UUID NOT NULL,
+    session_id  TEXT NOT NULL,
     role        TEXT CHECK (role IN ('user', 'assistant')) NOT NULL,
     content     TEXT NOT NULL,
     sources     JSONB,

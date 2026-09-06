@@ -31,14 +31,14 @@
 实测本机（macOS）现状：
 
 - Node `v22.22.2` / npm `10.9.7` ✅
+- `node_modules/` ✅ 已安装
 - `docker` ❌ 未安装
 - `psql` / `pg_isready` / `redis-cli` ❌ 未安装
-- `node_modules/` ❌ 未安装
-- `.env` ❌ 不存在（已复制 `.env.example` 后可解决）
-- `data/` ❌ 不存在（README 的 `--source ./data/` 会静默空转）
-- `embed_service.py` ❌ 不存在（但 `scripts/setup.sh` 结尾提示启动它）
+- `.env` ❌ 不存在（复制 `.env.example` 后可解决）
+- `data/` ✅ 已建（含 `.gitkeep`，放入文档即用）
+- Embedding 服务：已改为**纯 Node** 的 `src/embed_server.ts`，无需任何 Python 环境
 
-> `docker compose up -d` 与 `npm run health` 在当前机器上必然失败，需先补齐运行时。
+> `docker compose up -d` 与 `npm run health` 在当前机器上仍会失败（缺 docker / pg 客户端 / redis 客户端），需先补齐运行时。应用本身的依赖、类型检查与 lint 均已通过。
 
 ### 2.1 安装依赖
 
@@ -54,8 +54,8 @@ npm install
 docker compose up -d
 ```
 
-镜像为 `ankane/pgvector:0.6.0`，首次启动会自动执行 `db/init.sql`（已挂载到
-`docker-entrypoint-initdb.d`），建表、建索引、装 `vector` 扩展。
+镜像为 `ankane/pgvector:0.6.0`。**注意**：本项目不依赖容器的 `docker-entrypoint-initdb.d` 自动初始化，
+建表 / 建索引 / 装 `vector` 扩展统一由 `npm run migrate`（即 `db/migrate.ts`）完成，请遵循 2.3 步。
 
 无 Docker 时（当前机器）可选路径：
 
@@ -71,61 +71,29 @@ docker compose up -d
 npm run migrate        # npx ts-node db/migrate.ts
 ```
 
-脚本以 `_schema_migrations.version = '1.0.0'` 做幂等标记，重复执行会跳过。
-它与 2.2 的 `init.sql` 内容一致且都带 `IF NOT EXISTS`，两者重复执行不冲突。
+脚本以 `_schema_migrations.version = '1.1.0'` 做幂等标记，重复执行会跳过主体。
+它与 2.2 的 `init.sql` 内容一致且都带 `IF NOT EXISTS`，两者重复执行不冲突；
+同时包含对 1.0.0 存量库的原地升级（加列 / 换唯一键 / 重建索引）。
 
-### 2.4 启动 Embedding + Rerank 服务（必需，README 缺失实体文件）
+### 2.4 启动 Embedding + Rerank 服务（必需，纯 Node 实现）
 
-TypeScript 无法直接加载 sentence-transformers，必须起一个 Python 服务。
-把下面内容存为项目根目录 `embed_service.py`（README 只贴了代码，仓库里没有这个文件）：
-
-```python
-from fastapi import FastAPI
-from sentence_transformers import SentenceTransformer, CrossEncoder
-from pydantic import BaseModel
-import torch
-
-app = FastAPI()
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = SentenceTransformer("BAAI/bge-m3").to(device)
-reranker = CrossEncoder("BAAI/bge-reranker-v2-m3").to(device)
-
-class EmbedRequest(BaseModel):
-    texts: list[str]
-    model: str = "BAAI/bge-m3"
-
-class RerankRequest(BaseModel):
-    query: str
-    passages: list[str]
-    top_k: int = 10
-
-@app.get("/health")          # health-check.sh 会探测此路由，README 原版缺失
-def health():
-    return {"status": "ok"}
-
-@app.post("/embeddings")
-async def embed(req: EmbedRequest):
-    return {"embeddings": model.encode(req.texts, convert_to_list=True).tolist()}
-
-@app.post("/rerank")
-async def rerank(req: RerankRequest):
-    pairs = [(req.query, p) for p in req.passages]
-    scores = reranker.predict(pairs)
-    results = [{"index": i, "score": float(s)} for i, s in enumerate(scores)]
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return {"results": results[:req.top_k]}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
-```
+本项目自带**纯 Node** 的嵌入 / 重排服务 `src/embed_server.ts`，底层用 `@huggingface/transformers`
+（ONNX Runtime）直接加载 BGE-M3 / bge-reranker 的 ONNX 权重，**不再依赖任何 Python 环境**。
+对外接口（`/embeddings`、`/rerank`、`/health`）与旧版 Python 服务一致，`src/embeddings.ts` 无需改动。
 
 ```bash
-pip install "fastapi[all]" sentence-transformers
-python embed_service.py
+npm run embed-server        # 默认监听 :8001
 ```
 
-> 首次运行会下载 BGE-M3（约 2GB）与 reranker。CPU 模式下单批 64 条约数秒到数十秒，
+首次运行会从 HuggingFace 下载权重（BGE-M3 约 200MB + reranker 约 500MB）。国内网络可设镜像：
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com npm run embed-server
+```
+
+> 可用环境变量覆盖：`EMBED_SERVER_PORT`（默认 8001）、`EMBED_MODEL_ID`（默认 `Xenova/bge-m3`）、
+> `RERANK_MODEL_ID`（默认 `onnx-community/bge-reranker-v2-m3-ONNX`）、`EMBED_DTYPE`/`RERANK_DTYPE`
+> （默认 `q8`）、`EMBED_DEVICE`/`RERANK_DEVICE`（默认空=CPU）、`EMBED_MAX_LENGTH`、`RERANK_MAX_LENGTH`。
 > `src/embeddings.ts` 的 axios 超时是 60s，语料大时可能触发。
 
 ### 2.5 启动 LLM 服务（OpenAI 兼容）
@@ -220,36 +188,38 @@ curl -X POST http://localhost:9000/api/v1/documents \
 - 传了 `user_tags` → 返回标签**交集非空**的 chunk（不再默认放行 `public`，
   如需放行请显式把 `public` 放进 `user_tags`）。
 
-灌库默认打 `public`（`ingest.ts:12`、上传接口 `index.ts:239`）。
+灌库默认打 `public`（ingest 与上传接口均在入库时落 `['public']` 标签）。
 
 ---
 
-## 4. 已知问题与修复建议
+## 4. 已修复问题记录（v1.1.0）
 
-### P0 — 不处理就跑不通或有正确性风险
+> 以下 P0 / P1 条目在 v1.1.0 中已全部修复，此处保留记录便于审计与回滚核查。
 
-| # | 位置 | 问题 | 建议 |
-|---|------|------|------|
-| 1 | `db/init.sql:27` | ivfflat 索引声明 `vector_ip`（内积），但 `retriever.ts:62` 用 `<=>`（余弦距离）排序。算子与索引不匹配 → **索引完全失效，退化为全表扫描** | 改为 `USING ivfflat (embedding vector_cosine_ops)`，或把排序改成 `<=>` 对应的 `vector_cosine_ops` |
-| 2 | `db/init.sql:33`、`src/retriever.ts:78` | FTS 固定 `to_tsvector('english', ...)`。**中文语料几乎无法分词**，稀疏分支召回趋近于零，混合检索实际只剩稠密一路 | 中文场景改用 `'simple'`，或装 `pg_jieba` / `zhparser` 并配套改查询 |
-| 3 | `src/retriever.ts:164` | `RERANK_THRESHOLD` 在 config 中定义但**从未使用**，低分噪声不过滤 | 重排后 `if (score < config.RERANK_THRESHOLD) continue;` |
-| 4 | `src/index.ts:222-241` | 先插 `documents`，再在循环里逐条 `await` 插 chunk，**无事务**。中途失败会留下无 chunk 的孤儿文档；大文档入库是 N 次串行往返，很慢 | 包一个事务 + 批量 INSERT（`VALUES (...),(...)`）或 `COPY` |
-| 5 | `src/index.ts:238` | `ON CONFLICT (hash) DO NOTHING` 且 `hash` 是**全局唯一**的内容哈希。不同文档中的相同段落会被静默丢弃，而 `chunks_created` 仍按 chunk 总数上报 → 计数虚高 | 去重键改为 `(doc_id, hash)`，或按实际 `rowCount` 统计 |
-| 6 | `src/index.ts:47` | `/health` 里 `vector_db: 'connected'` 是硬编码，**从不真正探测数据库** | 加一次 `SELECT 1` |
-| 7 | `src/parsers.ts:114` | 灌库默认开启 PII 脱敏，会把邮箱/电话/卡号替换成占位符 → **库里存的内容与原文不一致**，回答引用的是脱敏后文本 | 明确为产品决策；如需原文溯源，加开关 |
+### P0 — 正确性 / 性能
+
+| # | 位置 | 问题 | 建议 | 状态 |
+|---|------|------|------|------|
+| 1 | `db/init.sql` | ivfflat 索引声明 `vector_ip`（内积），但排序用 `<=>`（余弦距离） → 索引失效 | 改为 `USING ivfflat (embedding vector_cosine_ops)` | ✅ 已修复：`init.sql:32` 已是 `vector_cosine_ops`（附注释说明原因） |
+| 2 | `db/init.sql`、`src/retriever.ts` | FTS 固定 `to_tsvector('english', ...)`，中文语料几乎无法分词，稀疏分支召回趋零 | 中文场景改用 `'simple'` 或 CJK 分词 | ✅ 已修复：新增 `chunks.search_text` 列 + 应用层 CJK bigram 分词（`src/tokenize.ts`），GIN 索引建在 `to_tsvector('simple', search_text)`；`npm run backfill-text` 可回填存量 |
+| 3 | `src/retriever.ts` | `RERANK_THRESHOLD` 定义但未使用，低分噪声不过滤 | 重排后按阈值过滤 | ✅ 已修复：`retriever.ts:176` `if (score < config.RERANK_THRESHOLD) continue;` |
+| 4 | `src/indexer.ts` | 入库无事务、逐条 `await` 插 chunk，易留孤儿文档且慢 | 包事务 + 批量 INSERT | ✅ 已修复：`indexer.ts:54` 起 `BEGIN`…批量 `VALUES (...)` 提交 |
+| 5 | `src/indexer.ts` | `ON CONFLICT (hash)` 全局唯一键，跨文档相同段落被静默丢弃，计数虚高 | 去重键改为 `(doc_id, hash)` | ✅ 已修复：`indexer.ts:92` `ON CONFLICT (doc_id, hash) DO NOTHING`，并返回真实落库行数 |
+| 6 | `src/index.ts` | `/health` 中 `vector_db: 'connected'` 硬编码，从不真正探测 | 加 `SELECT 1` 探针 | ✅ 已修复：`/health` 已对 db / redis / llm 三路真实探测 |
+| 7 | `src/parsers.ts` | 灌库默认开启 PII 脱敏，库内容与原文不一致 | 明确决策或加开关 | ✅ 已修复：`config.SCRUB_PII` 与 `parseDocument` 默认均为 `false`，默认存原文；两处调用点均显式传参 |
 
 ### P1 — 影响可维护性 / 安全
 
-| # | 位置 | 问题 | 建议 |
-|---|------|------|------|
-| 8 | `src/db.ts:15` | Redis 客户端建了，但业务代码零使用；`audit.ts:31` 的 `rateLimit` 是 `return true` 占位 | 要么落地限流/缓存，要么摘掉依赖 |
-| 9 | `db/init.sql:36`、`src/middleware/audit.ts` | `chat_history` / `audit_log` 表已建，但**从未写入**；`auditLogger` 也没在 `index.ts` 注册 | 挂 hook 或删除 |
-| 10 | `src/index.ts:35`、`310` | CORS `origin: true` + `credentials: true`；`/admin/metrics` 与上传接口**无任何鉴权** | 生产改为白名单 + API Key / JWT |
-| 11 | 根目录 | 无 ESLint 配置文件，`npm run lint` 必然失败 | 补 `.eslintrc.cjs` 或从 package.json 移除脚本 |
-| 12 | `scripts/health-check.sh:26` | 探测 `:8001/health`，但 README 给的 Python 服务没有该路由 → 恒为 FAIL | 已在本文档 2.4 的示例里补上 `/health` |
-| 13 | `db/migrate.ts:42` | `schema.split(';')` 切分 SQL，遇到字符串/函数体内的分号即崩 | 用 `pg` 的多语句直传，或引入 SQL 解析器 |
-| 14 | `src/index.ts:149` | SSE 用 `reply.raw.write` 且未处理背压，客户端断开时可能悬挂 | 监听 `reply.raw.on('close')` 终止生成 |
-| 15 | README | 步骤 4 的 `--source ./data/` 指向不存在的目录，无输出也**不报错** | 建 `data/` 或改示例路径 |
+| # | 位置 | 问题 | 建议 | 状态 |
+|---|------|------|------|------|
+| 8 | `src/db.ts`、`src/ratelimit.ts` | Redis 客户端建了，但业务代码零使用；`audit.ts` 的 `rateLimit` 是 `return true` 占位 | 要么落地限流/缓存，要么摘掉依赖 | ✅ 已修复：`src/ratelimit.ts` 基于 Redis 滑动窗口实现真实限流（`RATE_LIMIT_*` 可配），`index.ts` 的 chat/stream/upload 路由已接入 |
+| 9 | `db/init.sql`、`src/middleware/audit.ts` | `chat_history` / `audit_log` 表已建，但**从未写入**；`auditLogger` 也没在 `index.ts` 注册 | 挂 hook 或删除 | ✅ 已修复：`index.ts` 通过 `onResponse` hook 注册 `auditLogger`，问答后写入 `chat_history`（由 `CHAT_HISTORY_ENABLED` 控制） |
+| 10 | `src/index.ts` | CORS `origin: true` + `credentials: true`；`/admin/metrics` 与上传接口**无任何鉴权** | 生产改为白名单 + API Key / JWT | ✅ 已修复：CORS 改白名单（`CORS_ORIGIN`，`*` 时关闭 credentials）；`/api/v1/admin/*` 强制 `ADMIN_API_KEY`（fail-closed）；`API_KEY` 非空时全接口鉴权 |
+| 11 | 根目录 | 无 ESLint 配置文件，`npm run lint` 必然失败 | 补 `.eslintrc.cjs` 或从 package.json 移除脚本 | ✅ 已修复：新增 `.eslintrc.cjs`，`lint` 脚本范围扩到 `src/ db/` |
+| 12 | `scripts/health-check.sh` | 探测 `:8001/health`，但原 README 的 Python 服务没有该路由 → 恒为 FAIL | 补 `/health` 路由 | ✅ 已修复：embedding 服务已改为纯 Node（`src/embed_server.ts`），自带 `GET /health`；health-check 对依赖失败降级为 WARNING |
+| 13 | `db/migrate.ts` | `schema.split(';')` 切分 SQL，遇到字符串/函数体内的分号即崩 | 用 `pg` 的多语句直传，或引入 SQL 解析器 | ✅ 已修复：`init.sql` 整体交给 `pg` 多语句直传；并对空库调整执行顺序（`init.sql` 在 `applySchemaUpgrades` 之前） |
+| 14 | `src/index.ts` | SSE 用 `reply.raw.write` 且未处理背压，客户端断开时可能悬挂 | 监听 `reply.raw.on('close')` 终止生成 | ✅ 已修复：流式生成监听 `reply.raw` 的 `close` 事件，断连即 `stream.destroy()` 终止 |
+| 15 | README | 步骤 4 的 `--source ./data/` 指向不存在的目录，无输出也**不报错** | 建 `data/` 或改示例路径 | ✅ 已修复：仓库已建 `data/`（含 `.gitkeep`），`npm run ingest -- --source ./data/` 路径有效 |
 
 ### 已确认无问题
 

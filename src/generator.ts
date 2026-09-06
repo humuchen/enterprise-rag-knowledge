@@ -60,6 +60,14 @@ export class LLMClient {
   private baseUrl = config.LLM_BASE_URL;
   private modelName = config.LLM_MODEL_NAME;
 
+  private headers(): Record<string, string> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (config.LLM_API_KEY) {
+      headers.Authorization = `Bearer ${config.LLM_API_KEY}`;
+    }
+    return headers;
+  }
+
   async generate(
     query: string,
     results: SearchResult[],
@@ -78,7 +86,7 @@ export class LLMClient {
         max_tokens: maxTokens,
       },
       {
-        headers: { 'Content-Type': 'application/json' },
+        headers: this.headers(),
         timeout: 60000,
       },
     );
@@ -111,6 +119,7 @@ export class LLMClient {
     history: Array<{ role: string; content: string }> = [],
     temperature = 0.1,
     maxTokens = 2048,
+    shouldAbort?: () => boolean,
   ): AsyncGenerator<string> {
     const messages = buildMessages(query, results, history);
 
@@ -124,16 +133,20 @@ export class LLMClient {
         stream: true,
       },
       {
-        headers: { 'Content-Type': 'application/json' },
+        headers: this.headers(),
         responseType: 'stream',
         timeout: 60000,
       },
     );
 
-    const stream = res.data as NodeJS.ReadableStream;
+    const stream = res.data as NodeJS.ReadableStream & { destroy?: () => void };
     let buffer = '';
 
     for await (const chunk of stream) {
+      if (shouldAbort?.()) {
+        stream.destroy?.();
+        return;
+      }
       buffer += chunk.toString();
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
@@ -158,7 +171,10 @@ export class LLMClient {
 
   async healthCheck(): Promise<boolean> {
     try {
-      await axios.get(`${this.baseUrl}/models`, { timeout: 5000 });
+      await axios.get(`${this.baseUrl}/models`, {
+        timeout: 5000,
+        headers: config.LLM_API_KEY ? { Authorization: `Bearer ${config.LLM_API_KEY}` } : {},
+      });
       return true;
     } catch {
       return false;
