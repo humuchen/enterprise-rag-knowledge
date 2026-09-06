@@ -1,14 +1,17 @@
 // src/middleware/audit.ts
-import { FastifyRequest } from 'fastify';
+import type { FastifyRequest } from 'fastify';
 import { pool } from '../db';
+import { config } from '../config';
 
 // Audit logging middleware
 export async function auditLogger(
   request: FastifyRequest,
-  startTime: number,
+  latencyMs: number,
   retrievedIds: string[] = [],
 ): Promise<void> {
-  const latency = Date.now() - startTime;
+  if (!config.AUDIT_ENABLED) return;
+
+  const latency = Math.max(Math.round(latencyMs), 0);
 
   try {
     await pool.query(
@@ -27,8 +30,23 @@ export async function auditLogger(
   }
 }
 
-// Rate limiting placeholder
-export function rateLimit(userId: string): boolean {
-  // Implement Redis-based sliding window rate limiting
-  return true;
+// 写入一轮问答。失败只告警不计入主流程错误。
+export async function recordChatTurn(params: {
+  sessionId: string;
+  query: string;
+  answer: string;
+  sources: Array<{ chunkId: string; source: string; score: number }>;
+}): Promise<void> {
+  if (!config.CHAT_HISTORY_ENABLED) return;
+
+  const { sessionId, query, answer, sources } = params;
+  try {
+    await pool.query(
+      `INSERT INTO chat_history (session_id, role, content, sources, created_at)
+       VALUES ($1, 'user', $2, NULL, NOW()), ($1, 'assistant', $3, $4, NOW())`,
+      [sessionId, query, answer, JSON.stringify(sources ?? [])],
+    );
+  } catch (err) {
+    console.error('Chat history write failed:', (err as Error).message);
+  }
 }

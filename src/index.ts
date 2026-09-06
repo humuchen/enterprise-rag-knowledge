@@ -1,16 +1,26 @@
 // src/index.ts
 import Fastify from 'fastify';
+import cors from '@fastify/cors';
+import multipart from '@fastify/multipart';
 import { config } from './config';
-import { pool, closeConnections, VECTOR_DIMS } from './db';
+import { pool, redis, closeConnections } from './db';
 import { HybridRetriever, QueryContext } from './retriever';
 import { LLMClient } from './generator';
 import { chunkDocument } from './chunker';
 import { parseDocument } from './parsers';
-import { embedTexts } from './embeddings';
+import { indexDocument } from './indexer';
+import { auditLogger, recordChatTurn } from './middleware/audit';
+import { checkRateLimit, rateLimitIdentity } from './ratelimit';
 import { writeFile, unlink } from 'fs/promises';
 import { join, extname } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    retrievedIds?: string[];
+  }
+}
 
 interface ChatRequestBody {
   query: string;
@@ -22,6 +32,7 @@ interface ChatRequestBody {
 interface DocumentUploadResponse {
   document_id: string;
   chunks_created: number;
+  chunks_total: number;
   title: string;
   latency_ms: number;
 }
@@ -31,27 +42,108 @@ const fastify = Fastify({ logger: true });
 const retriever = new HybridRetriever();
 const llmClient = new LLMClient();
 
+const SUPPORTED_EXTS = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm'];
+const ADMIN_PREFIX = '/api/v1/admin';
+
+function parseCorsOrigins(): true | string[] {
+  const raw = config.CORS_ORIGIN.trim();
+  if (!raw || raw === '*') return true;
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
+}
+
 // Register plugins
-fastify.register(require('@fastify/cors'), {
-  origin: true,
-  credentials: true,
+const corsOrigins = parseCorsOrigins();
+fastify.register(cors, {
+  origin: corsOrigins,
+  // 反射任意来源时不能同时放行凭证，否则等于向全网开放身份。
+  credentials: corsOrigins !== true,
 });
 
-fastify.register(require('@fastify/multipart'), {
+fastify.register(multipart, {
   limits: {
     fileSize: 100 * 1024 * 1024,
   },
 });
 
-// Health check
-fastify.get('/health', async () => {
-  const llmOk = await llmClient.healthCheck();
-  return {
-    status: llmOk ? 'healthy' : 'degraded',
-    vector_db: 'connected',
+// 鉴权 + 限流
+fastify.addHook('onRequest', async (request, reply) => {
+  const path = (request.raw.url ?? '').split('?')[0];
+  if (path === '/health') return;
+
+  if (path.startsWith(ADMIN_PREFIX)) {
+    if (!config.ADMIN_API_KEY) {
+      return reply
+        .status(503)
+        .send({ error: 'Admin endpoints disabled: ADMIN_API_KEY is not configured' });
+    }
+    if (request.headers['x-api-key'] !== config.ADMIN_API_KEY) {
+      return reply.status(401).send({ error: 'Unauthorized' });
+    }
+    return;
+  }
+
+  if (!path.startsWith('/api/v1')) return;
+
+  if (config.API_KEY && request.headers['x-api-key'] !== config.API_KEY) {
+    return reply.status(401).send({ error: 'Unauthorized' });
+  }
+
+  if (!config.RATE_LIMIT_ENABLED) return;
+
+  const verdict = await checkRateLimit(
+    rateLimitIdentity(request),
+    config.RATE_LIMIT_MAX,
+    config.RATE_LIMIT_WINDOW_SEC,
+  );
+
+  if (!verdict.allowed) {
+    reply.header('Retry-After', String(verdict.retryAfterSec));
+    return reply.status(429).send({ error: 'Rate limit exceeded' });
+  }
+
+  reply.header('X-RateLimit-Remaining', String(verdict.remaining));
+});
+
+// 审计落库
+fastify.addHook('onResponse', async (request, reply) => {
+  await auditLogger(request, reply.getResponseTime(), request.retrievedIds ?? []);
+});
+
+async function probeDb(): Promise<boolean> {
+  try {
+    await pool.query('SELECT 1');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function probeRedis(): Promise<boolean> {
+  try {
+    await redis.ping();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Health check —— 真实探测各依赖，不再返回硬编码的 connected
+fastify.get('/health', async (_request, reply) => {
+  const [dbOk, redisOk, llmOk] = await Promise.all([
+    probeDb(),
+    probeRedis(),
+    llmClient.healthCheck(),
+  ]);
+
+  const status = dbOk && llmOk ? 'healthy' : 'degraded';
+
+  return reply.status(status === 'healthy' ? 200 : 503).send({
+    status,
+    vector_db: dbOk ? 'connected' : 'unavailable',
+    redis: redisOk ? 'connected' : 'unavailable',
     llm_endpoint: llmOk ? 'ok' : 'unavailable',
-    version: '1.0.0',
-  };
+    version: '1.1.0',
+  });
 });
 
 // Non-streaming chat
@@ -72,6 +164,7 @@ fastify.post('/api/v1/chat', async (request, reply) => {
   };
 
   const results = await retriever.retrieve(body.query, ctx);
+  request.retrievedIds = results.map(r => r.chunkId);
 
   if (!results.length) {
     return reply.send({
@@ -87,6 +180,13 @@ fastify.post('/api/v1/chat', async (request, reply) => {
     body.history ?? [],
   );
 
+  await recordChatTurn({
+    sessionId,
+    query: body.query,
+    answer: genResult.answer,
+    sources: results.map(r => ({ chunkId: r.chunkId, source: r.source, score: r.score })),
+  });
+
   return reply.send({
     answer: genResult.answer,
     citations: genResult.citations.map(c => ({
@@ -96,6 +196,7 @@ fastify.post('/api/v1/chat', async (request, reply) => {
       score: c.score,
     })),
     model: genResult.model,
+    latency_ms: Date.now() - start,
   });
 });
 
@@ -117,24 +218,41 @@ fastify.post('/api/v1/chat/stream', async (request, reply) => {
   };
 
   const results = await retriever.retrieve(body.query, ctx);
+  request.retrievedIds = results.map(r => r.chunkId);
+
+  reply.type('text/event-stream');
+  reply.header('Cache-Control', 'no-cache');
+
+  // 客户端断开时终止生成，避免上游 LLM 流继续消耗资源
+  let aborted = false;
+  request.raw.on('close', () => {
+    aborted = true;
+  });
 
   if (!results.length) {
-    reply.type('text/event-stream');
-    reply.header('Cache-Control', 'no-cache');
     return reply.send(
       `data: ${JSON.stringify({ type: 'done', answer: '抱歉，我在知识库中没有找到相关信息。', citations: [], latency_ms: Date.now() - start })}\n\n`,
     );
   }
 
-  reply.type('text/event-stream');
-  reply.header('Cache-Control', 'no-cache');
-
   const eventStream = (async function* () {
     yield `data: ${JSON.stringify({ type: 'metadata', session_id: sessionId, chunks_retrieved: results.length })}\n\n`;
 
-    for await (const token of llmClient.stream(body.query, results, body.history ?? [])) {
+    let answer = '';
+    for await (const token of llmClient.stream(
+      body.query,
+      results,
+      body.history ?? [],
+      0.1,
+      2048,
+      () => aborted,
+    )) {
+      if (aborted) return;
+      answer += token;
       yield `data: ${JSON.stringify({ type: 'token', content: token })}\n\n`;
     }
+
+    if (aborted) return;
 
     yield `data: ${JSON.stringify({ type: 'citations', items: results.map(r => ({
       chunk_id: r.chunkId,
@@ -144,12 +262,23 @@ fastify.post('/api/v1/chat/stream', async (request, reply) => {
     })) })}\n\n`;
 
     yield `data: ${JSON.stringify({ type: 'done', latency_ms: Date.now() - start })}\n\n`;
+
+    await recordChatTurn({
+      sessionId,
+      query: body.query,
+      answer,
+      sources: results.map(r => ({ chunkId: r.chunkId, source: r.source, score: r.score })),
+    });
   })();
 
   for await (const chunk of eventStream) {
+    if (aborted || reply.raw.destroyed) break;
     reply.raw.write(chunk);
   }
-  reply.raw.end();
+
+  if (!reply.raw.writableEnded) {
+    reply.raw.end();
+  }
 });
 
 // Document upload
@@ -191,8 +320,7 @@ fastify.post('/api/v1/documents', async (request, reply) => {
   }
 
   const ext = extname(fileName);
-  const supported = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm'];
-  if (!supported.includes(ext.toLowerCase())) {
+  if (!SUPPORTED_EXTS.includes(ext.toLowerCase())) {
     return reply.status(400).send({ error: `Unsupported file type: ${ext}` });
   }
 
@@ -200,7 +328,7 @@ fastify.post('/api/v1/documents', async (request, reply) => {
   await writeFile(tmpPath, fileBuffer);
 
   try {
-    const { text, lang } = await parseDocument(tmpPath, true);
+    const { text, lang } = await parseDocument(tmpPath, config.SCRUB_PII);
     if (text.length < 10) {
       throw new Error('Document too short after parsing');
     }
@@ -212,37 +340,19 @@ fastify.post('/api/v1/documents', async (request, reply) => {
       { language: lang, original_filename: fileName },
     );
 
-    if (!chunks.length) {
-      throw new Error('No chunks produced after splitting');
-    }
-
-    const texts = chunks.map(c => c.content);
-    const embeddings = await embedTexts(texts);
-
-    const res = await pool.query<{ id: string }>(
-      `INSERT INTO documents (source, title, metadata, created_at)
-       VALUES ($1, $2, $3, NOW())
-       RETURNING id`,
-      [fileName, title ?? fileName, JSON.stringify({ language: lang })],
-    );
-
-    const docId = res.rows[0].id;
-
-    for (let i = 0; i < chunks.length; i++) {
-      const emb = embeddings[i];
-      const vecStr = '[' + emb.slice(0, VECTOR_DIMS).map((v: number) => parseFloat(v.toFixed(6))).join(',') + ']';
-
-      await pool.query(
-        `INSERT INTO chunks (doc_id, content, hash, metadata, embedding, access_tags, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5::vector, $6, NOW(), NOW())
-         ON CONFLICT (hash) DO NOTHING`,
-        [docId, chunks[i].content, chunks[i].hash, JSON.stringify(chunks[i].metadata), vecStr, accessTags ?? ['public']],
-      );
-    }
+    const result = await indexDocument({
+      source: fileName,
+      title: title ?? fileName,
+      language: lang,
+      metadata: { original_filename: fileName },
+      chunks,
+      accessTags: accessTags ?? ['public'],
+    });
 
     return reply.status(201).send({
-      document_id: docId,
-      chunks_created: chunks.length,
+      document_id: result.docId,
+      chunks_created: result.chunksInserted,
+      chunks_total: result.chunksTotal,
       title: title ?? fileName,
       latency_ms: Date.now() - start,
     } as DocumentUploadResponse);
@@ -254,7 +364,7 @@ fastify.post('/api/v1/documents', async (request, reply) => {
       detail: error.message,
     });
   } finally {
-    await unlink(tmpPath);
+    await unlink(tmpPath).catch(() => undefined);
   }
 });
 
@@ -329,6 +439,13 @@ fastify.setErrorHandler((error, _request, reply) => {
 
 // Startup
 const start = async () => {
+  if (config.NODE_ENV === 'production' && !config.API_KEY) {
+    fastify.log.warn('API_KEY is not set: /api/v1/* is open to the network');
+  }
+  if (config.NODE_ENV === 'production' && !config.ADMIN_API_KEY) {
+    fastify.log.warn('ADMIN_API_KEY is not set: /api/v1/admin/* is disabled');
+  }
+
   try {
     await fastify.listen({ port: config.PORT, host: '0.0.0.0' });
     fastify.log.info(`RAG API running on http://0.0.0.0:${config.PORT}`);

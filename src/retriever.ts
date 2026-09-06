@@ -1,7 +1,8 @@
 // src/retriever.ts
-import { query, vectorJson, VECTOR_DIMS } from './db';
+import { query, vectorJson } from './db';
 import { config } from './config';
 import { embedTexts, rerank } from './embeddings';
+import { buildSearchText } from './tokenize';
 
 export interface QueryContext {
   userTags: string[];
@@ -69,21 +70,27 @@ async function denseRetrieve(
 }
 
 // Sparse retrieval via PostgreSQL FTS (BM25 approximation)
+// 查询侧必须与入库侧使用同一套 token 化规则（buildSearchText + simple 配置），
+// 否则中文 token 无法对齐，稀疏分支召回为零。
 async function sparseRetrieve(
   queryText: string,
   topK: number,
 ): Promise<SparseRow[]> {
+  const expanded = buildSearchText(queryText).trim();
+  if (!expanded) return [];
+
   const rows = await query<SparseRow>(
     `SELECT c.id, c.doc_id, c.content, c.metadata, c.access_tags,
-            ts_rank_cd(to_tsvector('english', c.content),
-                       phraseto_tsquery('english', $1)) AS rank,
+            ts_rank_cd(fts.tsv, q.query) AS rank,
             d.source, d.title, d.created_at
      FROM chunks c
      JOIN documents d ON c.doc_id = d.id
-     WHERE to_tsvector('english', c.content) @@ phraseto_tsquery('english', $1)
+     CROSS JOIN LATERAL to_tsvector('simple', coalesce(c.search_text, '')) AS fts(tsv)
+     CROSS JOIN LATERAL plainto_tsquery('simple', $1) AS q(query)
+     WHERE fts.tsv @@ q.query
      ORDER BY rank DESC
      LIMIT $2`,
-    [queryText.trim(), topK],
+    [expanded, topK],
   );
 
   return rows;
@@ -163,9 +170,10 @@ export class HybridRetriever {
     const passages = topCandidates.map(r => r.item.content);
     const reranked = await rerank(queryText, passages, config.TOP_K_RERANK);
 
-    // 6. Format results
+    // 6. Format results（丢弃低于阈值的重排结果，避免低分噪声进入上下文）
     const result: SearchResult[] = [];
     for (const { originalIndex, score } of reranked) {
+      if (score < config.RERANK_THRESHOLD) continue;
       const candidate = topCandidates[originalIndex];
       if (!candidate) continue;
       const item = candidate.item;
