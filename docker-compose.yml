@@ -1,20 +1,180 @@
 services:
+  # ---------------------------------------------------------------- PostgreSQL + pgvector
   db:
-    image: ankane/pgvector:0.6.0
+    image: ankane/pgvector:latest
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ragdb
       POSTGRES_USER: rag
       POSTGRES_PASSWORD: ${DB_PASSWORD:-ragpass}
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ---------------------------------------------------------------- Redis (rate-limiting)
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------- Embedding / Rerank service
+  # Pure-Node ONNX service (BGE-M3 + bge-reranker-v2-m3).
+  # First start downloads ~700 MB of model weights; HF cache is persisted in hf_cache.
+  embed-server:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    image: rag-embed-server
+    command: ["node", "dist/src/embed_server.js"]
+    environment:
+      EMBED_SERVER_PORT: 8001
+      EMBED_MODEL_ID: ${EMBED_MODEL_ID:-Xenova/bge-m3}
+      RERANK_MODEL_ID: ${RERANK_MODEL_ID:-onnx-community/bge-reranker-v2-m3-ONNX}
+      EMBED_DTYPE: ${EMBED_DTYPE:-q8}
+      RERANK_DTYPE: ${RERANK_DTYPE:-q8}
+      # 国内网络加速：HF_ENDPOINT=https://hf-mirror.com
+      HF_ENDPOINT: ${HF_ENDPOINT:-}
+      # 如需私有模型：HF_TOKEN: ${HF_TOKEN}
+    volumes:
+      - hf_cache:/app/.cache/huggingface
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').request({host:'localhost',port:8001,path:'/health'},r=>{process.exit(r.statusCode===200?0:1)}).end()"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # ---------------------------------------------------------------- DB migration (one-shot)
+  # Runs db/migrate.ts on startup, then exits.  The api service waits for this
+  # to complete (condition: service_completed_successfully) so the schema is
+  # always ready before the API starts handling requests.
+  migrate:
+    build:
+      context: .
+      target: runtime
+    image: rag-api
+    command: ["node", "dist/db/migrate.js"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-ragdb}
+      DB_USER: ${DB_USER:-rag}
+      DB_PASSWORD: ${DB_PASSWORD:-ragpass}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    restart: "no"
+
+  # ---------------------------------------------------------------- FastAPI RAG API
+  api:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    image: rag-api
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      embed-server:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      # ---- 服务 ----
+      PORT: 9000
+      NODE_ENV: production
+
+      # ---- PostgreSQL + pgvector
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-ragdb}
+      DB_USER: ${DB_USER:-rag}
+      DB_PASSWORD: ${DB_PASSWORD:-ragpass}
+
+      # ---- Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      # ---- Embedding / Rerank (internal Docker DNS)
+      EMBEDDING_ENDPOINT_URL: http://embed-server:8001/embeddings
+      RERANK_ENDPOINT_URL: http://embed-server:8001/rerank
+
+      # ---- LLM (OpenAI-compatible, e.g. Ollama / vLLM)
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://llm:8000/v1}
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-Qwen/Qwen1.5-7B-Chat}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+
+      # ---- 检索与切分
+      CHUNK_SIZE: ${CHUNK_SIZE:-300}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-30}
+      TOP_K_RETRIEVAL: ${TOP_K_RETRIEVAL:-50}
+      TOP_K_RERANK: ${TOP_K_RERANK:-10}
+      RERANK_THRESHOLD: ${RERANK_THRESHOLD:-0.1}
+
+      # ---- 数据处理
+      SCRUB_PII: ${SCRUB_PII:-false}
+
+      # ---- 安全
+      API_KEY: ${API_KEY:-}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+
+      # ---- 可观测性
+      AUDIT_ENABLED: ${AUDIT_ENABLED:-true}
+      CHAT_HISTORY_ENABLED: ${CHAT_HISTORY_ENABLED:-true}
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      # Any HTTP response (200/degraded/503) means the process is alive;
+      # only a non-response (connection refused) counts as failure.
+      test: ["CMD", "node", "-e", "require('http').request({host:'localhost',port:9000,path:'/health'},r=>{process.exit(0)}).on('error',()=>process.exit(1)).end()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------- LLM service (optional)
+  # Any OpenAI-compatible backend works.  Ollama is bundled for convenience.
+  # If you already run an LLM elsewhere, set LLM_BASE_URL accordingly and
+  # `docker compose up -d` without the llm service, or comment it out.
+  llm:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    # Pull your model after `docker compose up`:
+    #   docker exec -it $(docker ps -q -f name=llm) ollama run Qwen1.5-7B-Chat
+    # Then the API can reach it at http://llm:8000/v1 (Ollama OpenAI-compatible endpoint).
+    # For vLLM or other engines, swap this service or point LLM_BASE_URL at your endpoint.
+    volumes:
+      - ollama_models:/root/.ollama
 
 volumes:
   pg_data:
+  hf_cache:
+  ollama_models:

@@ -24,9 +24,51 @@
 
 ---
 
-## 2. 部署步骤
+## 2. Docker 部署（推荐）
 
-### 2.0 前置检查（当前机器状态）
+项目已提供 `Dockerfile` 与 `docker-compose.yml`，支持一键部署全部依赖。
+
+### 2.2.1 Docker Compose 启动
+
+```bash
+# 1. 复制环境变量模板
+cp .env.docker.example .env
+# 按需修改 .env（生产环境必填 API_KEY / ADMIN_API_KEY）
+
+# 2. 构建镜像
+docker compose build
+
+# 3. 启动全部服务
+docker compose up -d
+```
+
+compose 包含 5 个服务：
+
+| 服务 | 端口 | 说明 |
+|------|------|------|
+| db | 5432 | PostgreSQL + pgvector |
+| redis | 6379 | Redis（限流） |
+| embed-server | 8001 | BGE-M3 embedding + rerank（纯 Node ONNX） |
+| api | 9000 | Fastify RAG API |
+| llm | 8000 | Ollama（可选） |
+
+startup order：db + redis → embed-server → migrate（一次性）→ api。
+
+### 2.2.2 LLM 服务
+
+默认 `llm` 服务运行 Ollama。首次启动后需手动拉取模型：
+
+```bash
+# 拉取模型
+docker exec -it rag-llm ollama run Qwen1.5-7B-Chat
+# 然后 API 就可以通过 http://llm:8000/v1 访问
+```
+
+如已有 LLM 服务（vLLM 等），可在 `.env` 中设置 `LLM_BASE_URL=http://your-llm:8000/v1`，并在 `docker compose up -d` 时跳过 `llm` 服务：
+
+```bash
+docker compose up -d db redis embed-server api   # 不启动 llm 服务
+```
 
 实测本机（macOS）现状：
 

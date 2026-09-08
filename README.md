@@ -87,5 +87,7 @@ scripts/     初始化与健康检查脚本
 
 ## 更多
 
+- 接口文档：见 [`docs/API.md`](./docs/API.md)
+- Docker 一键部署：见 [`docs/DEPLOY.md`](./docs/DEPLOY.md) 2.2 节
 - 部署拓扑、依赖与排障：见 [`docs/DEPLOY.md`](./docs/DEPLOY.md)
 - 检索链路图示：见 `docs/RAG项目部署拓扑与依赖.png`

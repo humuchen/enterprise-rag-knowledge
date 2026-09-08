@@ -1,5 +1,5 @@
 // src/ingest.ts
-import { pool } from './db';
+import { pool, redis } from './db';
 import { chunkDocument } from './chunker';
 import { parseDocument } from './parsers';
 import { config } from './config';
@@ -101,6 +101,8 @@ async function main() {
     process.exit(1);
   } finally {
     await pool.end();
+    redis.disconnect();
+    process.exit(0);
   }
 }
 

@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.git.bak
+*.log
+npm-debug.log*
+docker-compose*.yml
+Dockerfile
+.dockerignore
+.env
+.env.local
+.env.*.local
+workbuddy

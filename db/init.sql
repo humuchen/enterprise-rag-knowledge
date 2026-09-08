@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     metadata    JSONB DEFAULT '{}',
     embedding   VECTOR(1024),
     access_tags TEXT[] DEFAULT '{}',
+    source      TEXT,
     created_at  TIMESTAMPTZ DEFAULT NOW(),
     updated_at  TIMESTAMPTZ DEFAULT NOW(),
     CONSTRAINT chunks_doc_id_hash_key UNIQUE (doc_id, hash)

@@ -1,5 +1,5 @@
 // db/migrate.ts
-import { pool } from '../src/db';
+import { pool, redis } from '../src/db';
 import { readFileSync } from 'fs';
 import path from 'path';
 
@@ -31,8 +31,9 @@ async function markMigrated(): Promise<void> {
 
 // 对 1.0.0 建起来的库做原地升级。全部语句幂等，可重复执行。
 async function applySchemaUpgrades(): Promise<void> {
-  // 1. 新增中文检索列
+  // 1. 新增中文检索列 + source 列 (v1.1.0 之后新加的 source 列)
   await pool.query(`ALTER TABLE chunks ADD COLUMN IF NOT EXISTS search_text TEXT`);
+  await pool.query(`ALTER TABLE chunks ADD COLUMN IF NOT EXISTS source TEXT`);
 
   // 2. hash 唯一键：全局唯一 -> (doc_id, hash)
   await pool.query(`
@@ -137,7 +138,11 @@ async function runMigration(): Promise<void> {
 }
 
 runMigration()
-  .then(() => process.exit(0))
+  .then(async () => {
+    await pool.end();
+    redis.disconnect();
+    process.exit(0);
+  })
   .catch(err => {
     console.error('Migration failed:', err.message);
     process.exit(1);

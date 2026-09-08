@@ -69,10 +69,10 @@ export async function indexDocument(params: IndexParams): Promise<IndexResult> {
       const values: unknown[] = [];
 
       slice.forEach((chunk, j) => {
-        const base = j * 7;
+        const base = j * 8;
         placeholders.push(
           `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::vector, ` +
-          `$${base + 6}, $${base + 7}, NOW(), NOW())`,
+          `$${base + 6}, $${base + 7}, $${base + 8}, NOW(), NOW())`,
         );
         values.push(
           docId,
@@ -82,6 +82,7 @@ export async function indexDocument(params: IndexParams): Promise<IndexResult> {
           toVectorLiteral(embeddings[offset + j]),
           JSON.stringify(chunk.metadata ?? {}),
           tags,
+          source,
         );
       });
 
