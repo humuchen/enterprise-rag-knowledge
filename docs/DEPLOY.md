@@ -70,18 +70,6 @@ docker exec -it rag-llm ollama run Qwen1.5-7B-Chat
 docker compose up -d db redis embed-server api   # 不启动 llm 服务
 ```
 
-实测本机（macOS）现状：
-
-- Node `v22.22.2` / npm `10.9.7` ✅
-- `node_modules/` ✅ 已安装
-- `docker` ❌ 未安装
-- `psql` / `pg_isready` / `redis-cli` ❌ 未安装
-- `.env` ❌ 不存在（复制 `.env.example` 后可解决）
-- `data/` ✅ 已建（含 `.gitkeep`，放入文档即用）
-- Embedding 服务：已改为**纯 Node** 的 `src/embed_server.ts`，无需任何 Python 环境
-
-> `docker compose up -d` 与 `npm run health` 在当前机器上仍会失败（缺 docker / pg 客户端 / redis 客户端），需先补齐运行时。应用本身的依赖、类型检查与 lint 均已通过。
-
 ### 2.1 安装依赖
 
 ```bash
@@ -127,22 +115,59 @@ npm run migrate        # npx ts-node db/migrate.ts
 npm run embed-server        # 默认监听 :8001
 ```
 
-首次运行会从 HuggingFace 下载权重（BGE-M3 约 200MB + reranker 约 500MB）。国内网络可设镜像：
+首次运行会从 HuggingFace 下载权重。**建议先用下载脚本把权重拉到本地**：
 
 ```bash
-HF_ENDPOINT=https://hf-mirror.com npm run embed-server
+npm run download-models     # 下到 ./models（约 1.1 GB）
+MODELS_DIR=./models npm run embed-server
 ```
+
+脚本默认走 **ModelScope（国内源）**，自带 16 MB 分片 + 失败重试 + 断点续传。
+
+> **为什么不用 transformers.js 自带的下载？**
+> HuggingFace 已把 LFS 迁到 Xet 存储，`resolve` 会 302 到境外 CDN（`us.aws.cdn.hf.co`），
+> 对分片请求（Range）直接返回 **400**，流式读取也会在几 MB 处被切断，
+> 最终表现为 ONNX Runtime 抛 `terminated` —— 极难排查。
+> `HF_ENDPOINT=https://hf-mirror.com` 同样会跳到该 CDN，并不能解决。
+> 换源：`MODEL_SOURCE=huggingface npm run download-models`。
+
+> **dtype 必须真实存在于仓库**：dtype 会映射到 `onnx/model_<dtype>.onnx`。
+> `Xenova/bge-m3` 与 `onnx-community/bge-reranker-v2-m3-ONNX` **都没有 `q8` 档位**，
+> 填 `q8` 会静默回退到 fp32，而 fp32 权重在外部数据文件 `onnx/model.onnx_data`（2.2 GB）里，
+> 缺它同样只报 `terminated`。默认已改为 **`int8`**（单文件自包含，约 545 MB，CPU 推理最快）。
+> 可选档位：`int8`(545 MB) / `q4f16` / `q4`(1.2 GB) / `fp16`(1.1 GB) / `fp32`(2.2 GB + 外部数据)。
 
 > 可用环境变量覆盖：`EMBED_SERVER_PORT`（默认 8001）、`EMBED_MODEL_ID`（默认 `Xenova/bge-m3`）、
 > `RERANK_MODEL_ID`（默认 `onnx-community/bge-reranker-v2-m3-ONNX`）、`EMBED_DTYPE`/`RERANK_DTYPE`
-> （默认 `q8`）、`EMBED_DEVICE`/`RERANK_DEVICE`（默认空=CPU）、`EMBED_MAX_LENGTH`、`RERANK_MAX_LENGTH`。
+> （默认 `int8`）、`MODELS_DIR`（默认 `./models`）、`EMBED_DEVICE`/`RERANK_DEVICE`（默认空=CPU）、
+> `EMBED_MAX_LENGTH`、`RERANK_MAX_LENGTH`。
 > `src/embeddings.ts` 的 axios 超时是 60s，语料大时可能触发。
+
+> 权重默认落在 `./models`（`.gitignore` 已忽略）。Docker 部署时该目录会被挂载到 `/app/models`，
+> 容器无需联网即可加载。若目录为空，服务才会回退到远程下载。
 
 ### 2.5 启动 LLM 服务（OpenAI 兼容）
 
 默认 `LLM_BASE_URL=http://localhost:8000/v1`、`LLM_MODEL_NAME=Qwen/Qwen1.5-7B-Chat`。
 任选其一：vLLM、Ollama（`--openai` 兼容模式）、或任何 OpenAI 协议网关。
 健康检查会请求 `{LLM_BASE_URL}/models`。
+
+> **`docker pull` 大镜像反复失败？**
+> 若看到 `short read: expected 3250030508 bytes but got 140279039: unexpected EOF`，
+> 说明本机出网对**单条长连接的大流量传输**不稳定（换国内 registry 镜像源也一样，
+> 只是断点位置略变）。用仓库自带的分段拉取脚本绕开：
+>
+> ```bash
+> # 在容器内执行（容器出网通常比宿主机宽松）
+> docker run --rm -v "$PWD/images:/out" -v "$PWD/scripts/pull-image.mjs:/app/pull-image.mjs:ro" \
+>   rag-embed-server:latest node /app/pull-image.mjs ollama/ollama --out /out
+>
+> cd images/.work-ollama_ollama && tar cf ../ollama-ollama.tar . && cd ..
+> docker load -i ollama-ollama.tar
+> ```
+>
+> 脚本用 16 MB 分片 + 失败重试 + 断点续传直连 registry，再组装成 `docker-archive` 导入。
+> 中断后重跑会自动续传，不用从头开始。
 
 ### 2.6 灌库
 

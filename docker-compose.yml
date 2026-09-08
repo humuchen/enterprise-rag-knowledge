@@ -44,12 +44,15 @@ services:
       EMBED_SERVER_PORT: 8001
       EMBED_MODEL_ID: ${EMBED_MODEL_ID:-Xenova/bge-m3}
       RERANK_MODEL_ID: ${RERANK_MODEL_ID:-onnx-community/bge-reranker-v2-m3-ONNX}
-      EMBED_DTYPE: ${EMBED_DTYPE:-q8}
-      RERANK_DTYPE: ${RERANK_DTYPE:-q8}
+      EMBED_DTYPE: ${EMBED_DTYPE:-int8}
+      RERANK_DTYPE: ${RERANK_DTYPE:-int8}
+      # 权重目录：先跑 `npm run download-models` 下到 ./models，容器即可离线启动
+      MODELS_DIR: /app/models
       # 国内网络加速：HF_ENDPOINT=https://hf-mirror.com
       HF_ENDPOINT: ${HF_ENDPOINT:-}
       # 如需私有模型：HF_TOKEN: ${HF_TOKEN}
     volumes:
+      - ./models:/app/models
       - hf_cache:/app/.cache/huggingface
     ports:
       - "8001:8001"

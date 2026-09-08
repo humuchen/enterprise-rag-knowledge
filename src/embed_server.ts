@@ -21,8 +21,12 @@ import {
 // ---------------------------------------------------------------------------
 const EMBED_MODEL_ID = process.env.EMBED_MODEL_ID ?? 'Xenova/bge-m3';
 const RERANK_MODEL_ID = process.env.RERANK_MODEL_ID ?? 'onnx-community/bge-reranker-v2-m3-ONNX';
-const EMBED_DTYPE = (process.env.EMBED_DTYPE ?? 'q8') as any;
-const RERANK_DTYPE = (process.env.RERANK_DTYPE ?? 'q8') as any;
+// 注意：dtype 必须在该模型仓库里真实存在对应文件 onnx/model_<dtype>.onnx。
+// Xenova/bge-m3 与 onnx-community/bge-reranker-v2-m3-ONNX 都没有 q8 档位，
+// 填 q8 会回退到 fp32，而 fp32 的权重放在外部数据文件 onnx/model.onnx_data（2.2 GB）里，
+// 缺失时 ONNX Runtime 只报 "terminated"，很难排查。int8 是单文件自包含（约 570 MB），最稳。
+const EMBED_DTYPE = (process.env.EMBED_DTYPE ?? 'int8') as any;
+const RERANK_DTYPE = (process.env.RERANK_DTYPE ?? 'int8') as any;
 const EMBED_DEVICE = process.env.EMBED_DEVICE || undefined; // 不传则库自动选 cpu
 const RERANK_DEVICE = process.env.RERANK_DEVICE || undefined;
 const EMBED_POOLING = process.env.EMBED_POOLING ?? 'cls';
@@ -32,9 +36,25 @@ const RERANK_MAX_LENGTH = Number(process.env.RERANK_MAX_LENGTH ?? 512);
 const EMBED_SERVER_PORT = Number(process.env.EMBED_SERVER_PORT ?? 8001);
 const EMBED_SERVER_HOST = process.env.EMBED_SERVER_HOST ?? '0.0.0.0';
 
+// 本地模型目录：npm run download-models 会把权重下到 <MODELS_DIR>/<model_id>/
+const MODELS_DIR = process.env.MODELS_DIR ?? './models';
+
 // 国内网络可设置 HF_ENDPOINT=https://hf-mirror.com 走镜像下载权重
 if (process.env.HF_ENDPOINT) {
   tfEnv.remoteHost = process.env.HF_ENDPOINT.replace(/\/$/, '') + '/';
+}
+
+// 优先读本地模型目录。权重已由 scripts/download-models.mjs 下好时完全离线启动，
+// 不必再走境外 CDN（HuggingFace 的 Xet CDN 对分片请求返回 400，几百 MB 下不完）。
+tfEnv.allowLocalModels = true;
+tfEnv.localModelPath = MODELS_DIR;
+
+// transformers.js 的 cacheDir 默认落在包目录内的 ./.cache（镜像里即
+// /app/node_modules/@huggingface/transformers/.cache），既不读 HF_HOME，
+// 也不会被 docker volume 持久化 —— 容器一重启几百 MB 权重就白下了。
+// 这里显式对齐 HF_HOME，保证权重落在挂载的卷上。
+if (process.env.HF_HOME) {
+  tfEnv.cacheDir = process.env.HF_HOME;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +196,7 @@ app.listen({ port: EMBED_SERVER_PORT, host: EMBED_SERVER_HOST }, (err, address) 
     process.exit(1);
   }
   console.log(`[embed-server] listening on ${address}`);
+  console.log(`[embed-server] models dir = ${MODELS_DIR} (本地权重优先，缺失才回退远程)`);
   console.log(`[embed-server] embedding=${EMBED_MODEL_ID} (dtype=${EMBED_DTYPE}${EMBED_DEVICE ? `, device=${EMBED_DEVICE}` : ''})`);
   console.log(`[embed-server] reranker=${RERANK_MODEL_ID} (dtype=${RERANK_DTYPE}${RERANK_DEVICE ? `, device=${RERANK_DEVICE}` : ''})`);
 });

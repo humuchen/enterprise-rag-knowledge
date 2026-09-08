@@ -11,6 +11,13 @@ data/
 .env.*.local
 
 
+# 模型权重（几百 MB，由 npm run download-models 拉到本地，不入库）
+models/
+*.onnx
+*.onnx_data
+
+# pull-image.mjs 的中间产物与最终 tar（数 GB，docker load 后即用即删）
+
 # WorkBuddy 项目级记忆（开发者 scratch 笔记）：含内部绝对路径、沙箱守卫绕过手法、
 # 项目决策记录等，不应随仓库分发或进入生产环境（Render 原生 node buildpack 会 clone
 # 整个仓库）。仅排除 memory/，注册壳 .workbuddy/skills/ 仍需入库（团队共享的发现入口）。

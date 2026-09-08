@@ -11,6 +11,7 @@
     "ingest": "ts-node src/ingest.ts",
     "backfill-text": "ts-node src/ingest.ts --backfill-text",
     "embed-server": "ts-node src/embed_server.ts",
+    "download-models": "node scripts/download-models.mjs",
     "migrate": "ts-node db/migrate.ts",
     "health": "bash scripts/health-check.sh",
     "lint": "eslint src/ db/ --ext .ts"

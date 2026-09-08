@@ -7,6 +7,15 @@ WORKDIR /app
 
 # Install only production deps first (better layer caching)
 COPY package.json package-lock.json ./
+# NPM_REGISTRY 可选：国内网络可传 https://registry.npmmirror.com 加速。
+# 不传时用默认 registry，镜像保持可移植。
+ARG NPM_REGISTRY=""
+# --fetch-retries 应对链路抖动：onnxruntime-node 等大包常在下到一半被重置。
+RUN npm ci --no-audit --no-fund \
+    --fetch-retries=10 --fetch-retry-mintimeout=5000 --fetch-retry-maxtimeout=120000 \
+    --fetch-timeout=600000 \
+    ${NPM_REGISTRY:+--registry=$NPM_REGISTRY}
+
 RUN npm ci --no-audit --no-fund
 
 # Full source copy + build
@@ -36,8 +45,13 @@ COPY --from=builder /app/dist/ ./dist/
 COPY --from=builder /app/db/ ./db/
 COPY package.json ./
 # Create writable runtime dirs (data may be bind-mounted by the user)
-RUN mkdir -p /app/.cache/huggingface /app/data /app/logs && \
-    chmod -R 777 /app/.cache /app/data /app/logs
+# Prefer local weights: `npm run download-models` populates ./models, which is
+# bind-mounted at runtime.  Keep the HF cache writable for remote fallback.
+RUN mkdir -p /app/.cache/huggingface /app/models /app/data /app/logs && \
+    chmod -R 777 /app/.cache /app/models /app/data /app/logs
+    
+# RUN mkdir -p /app/.cache/huggingface /app/data /app/logs && \
+#     chmod -R 777 /app/.cache /app/data /app/logs
 
 EXPOSE 9000 8001
 

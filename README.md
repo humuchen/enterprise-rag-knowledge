@@ -63,12 +63,15 @@ Node 侧**不加载模型**，只通过 HTTP 调用，因此有两个必需的�
 
    ```bash
    npm install
+   npm run download-models   # 预下载权重到 ./models（约 1.1 GB，国内源 + 断点续传）
    npm run embed-server      # 默认监听 :8001，提供 /embeddings、/rerank、/health
    ```
 
    接口契约与任意 OpenAI 兼容实现一致；若想换更快/更小的模型，改环境变量
    `EMBED_MODEL_ID`（并同步 `db/init.sql` 的向量维度）即可。
    模型切换、量化档位、国内镜像下载等见 [部署文档 2.4 节](./docs/DEPLOY.md)。
+   > 必须先 `download-models`：直接启动会因境外 CDN 不可用而失败
+   > （HuggingFace 的 Xet CDN 对分片请求返回 400，详见部署文档）。
 2. **LLM 服务**：任意 OpenAI 兼容后端即可，纯 HTTP，无 Node/Python 依赖。
 
 ## 目录说明
