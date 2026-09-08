@@ -87,7 +87,7 @@ export class LLMClient {
       },
       {
         headers: this.headers(),
-        timeout: 60000,
+        timeout: Number(process.env.LLM_TIMEOUT_MS ?? 300000), // CPU 推理长上下文会远超 60s
       },
     );
 
@@ -135,7 +135,7 @@ export class LLMClient {
       {
         headers: this.headers(),
         responseType: 'stream',
-        timeout: 60000,
+        timeout: Number(process.env.LLM_TIMEOUT_MS ?? 300000), // CPU 推理长上下文会远超 60s
       },
     );
 
