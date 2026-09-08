@@ -174,5 +174,17 @@ export async function reindexAllEmbeddings(): Promise<number> {
     console.log(`Reindexed ${processed}/${rows.length}`);
   }
 
+  // 向量索引必须在重算后重建：ivfflat 是离库快照，批量更新 embedding 后若不 REINDEX，
+  // ORDER BY embedding <=> query LIMIT 走索引会返回空/错结果（典型“重算后检索全失效”陷阱）。
+  console.log('Rebuilding vector index chunks_embedding_idx ...');
+  try {
+    await pool.query('REINDEX INDEX CONCURRENTLY chunks_embedding_idx');
+    console.log('Vector index rebuilt');
+  } catch (err) {
+    // CONCURRENTLY 失败（如仍在事务中）则退化为普通 REINDEX
+    await pool.query('REINDEX INDEX chunks_embedding_idx');
+    console.log('Vector index rebuilt (fallback)');
+  }
+
   return processed;
 }

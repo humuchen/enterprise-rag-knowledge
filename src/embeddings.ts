@@ -22,7 +22,7 @@ export interface RerankResponse {
   results: Array<{ index: number; score: number }>;
 }
 
-export async function embedTexts(texts: string[], batchSize: number = 64): Promise<number[][]> {
+export async function embedTexts(texts: string[], batchSize: number = 32): Promise<number[][]> {
   const embeddings: number[][] = [];
 
   for (let i = 0; i < texts.length; i += batchSize) {
@@ -34,7 +34,8 @@ export async function embedTexts(texts: string[], batchSize: number = 64): Promi
         model: 'BAAI/bge-m3',
       }, {
         headers: { 'Content-Type': 'application/json' },
-        timeout: 60000,
+        // CPU 推理下大批量编码会远超 60s，超时改为可配置（默认 5 分钟）
+        timeout: Number(process.env.EMBED_TIMEOUT_MS ?? 300000),
       });
 
       embeddings.push(...res.data.embeddings);
@@ -61,7 +62,7 @@ export async function rerank(
     top_k: topK ?? config.TOP_K_RERANK,
   }, {
     headers: { 'Content-Type': 'application/json' },
-    timeout: 60000,
+    timeout: Number(process.env.EMBED_TIMEOUT_MS ?? 300000),
   });
 
   return res.data.results.map(r => ({
