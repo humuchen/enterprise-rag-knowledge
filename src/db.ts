@@ -28,10 +28,11 @@ export const one = async <T = any>(text: string, params?: any[]): Promise<T | nu
   return (res.rows?.[0] as T) ?? null;
 };
 
-// 在受控事务内执行查询，并注入 RLS 会话变量。
+// 在受控事务内执行查询，并注入 RLS / pgcrypto 会话变量。
 // 会话变量用 set_config(..., true)（事务级本地），不会泄漏到连接池的其它请求。
 // allowedTags 为空且非超级用户时回落 'public'，与应用层 accessFilterSql 语义一致。
-// RLS 策略关闭时这些变量不会被任何策略读取，行为完全等价普通查询。
+// RLS 策略关闭时这些变量不会被任何策略读取；app.content_key 仅在配置了
+// CONTENT_ENCRYPTION_KEY 时注入，供 app_pgp_decrypt() 解密 content_pgp 使用。
 export const queryWithAccess = async <T = any>(
   text: string,
   params: any[] = [],
@@ -42,10 +43,18 @@ export const queryWithAccess = async <T = any>(
   try {
     await client.query('BEGIN');
     const tags = isSuperuser ? '' : (allowedTags.length ? allowedTags : ['public']).join(',');
-    await client.query(
-      "SELECT set_config('app.current_tags', $1, true), set_config('app.is_superuser', $2, true)",
-      [tags, isSuperuser ? 'on' : 'off'],
-    );
+    const sets: string[] = [];
+    const setParams: unknown[] = [];
+    sets.push(`set_config('app.current_tags', $${setParams.length + 1}, true)`);
+    setParams.push(tags);
+    sets.push(`set_config('app.is_superuser', $${setParams.length + 1}, true)`);
+    setParams.push(isSuperuser ? 'on' : 'off');
+    const contentKey = config.CONTENT_ENCRYPTION_KEY?.trim() ?? '';
+    if (contentKey) {
+      sets.push(`set_config('app.content_key', $${setParams.length + 1}, true)`);
+      setParams.push(contentKey);
+    }
+    await client.query(`SELECT ${sets.join(', ')}`, setParams);
     const res = await client.query(text, params);
     await client.query('COMMIT');
     return res.rows as T[];

@@ -118,6 +118,34 @@ async function applySchemaUpgrades(): Promise<void> {
   // 8. 受控启用数据库层行级安全（RLS）。仅当 DB_RLS_ENABLED=true 时建立，
   //    否则保持关闭（应用层 access_tags 过滤已提供主防护）。
   await applyRlsPolicy();
+
+  // 9. 数据库层加密（pgcrypto）：与 init.sql 完全等价，保证旧库升级幂等。
+  //    content_pgp 是独立于 content_enc（应用层 AES）的第二层加密列；
+  //    app_pgp_decrypt 是 SECURITY DEFINER 授权解密函数，复用 RLS 会话变量。
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
+  await pool.query(`ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_pgp BYTEA`);
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION app_pgp_decrypt(enc BYTEA, row_tags TEXT[])
+    RETURNS TEXT
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+    AS $$
+    DECLARE
+      is_su    TEXT := current_setting('app.is_superuser', 'off');
+      cur_tags TEXT := current_setting('app.current_tags', '');
+      enc_key  TEXT := current_setting('app.content_key', '');
+    BEGIN
+      IF enc IS NULL THEN RETURN NULL; END IF;
+      IF enc_key = '' THEN RETURN NULL; END IF;
+      IF is_su = 'on' THEN RETURN pgp_sym_decrypt(enc, enc_key); END IF;
+      IF row_tags && string_to_array(cur_tags, ',') THEN
+        RETURN pgp_sym_decrypt(enc, enc_key);
+      END IF;
+      RETURN NULL;
+    END;
+    $$;
+  `);
 }
 
 // 在 chunks 表建立 FOR SELECT 的 RLS 策略。读取路径（retriever）会在事务内

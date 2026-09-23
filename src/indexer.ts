@@ -57,6 +57,15 @@ export async function indexDocument(params: IndexParams): Promise<IndexResult> {
   try {
     await client.query('BEGIN');
 
+    // 写入前注入 pgcrypto 会话密钥（事务级本地），供 content_pgp 列加密使用。
+    // 缺失密钥时不注入：content_pgp 落 NULL，退化为由上层 content_enc 负责。
+    if (hasKey) {
+      await client.query(
+        "SELECT set_config('app.content_key', $1, true)",
+        [config.CONTENT_ENCRYPTION_KEY.trim()],
+      );
+    }
+
     const docRes = await client.query<{ id: string }>(
       `INSERT INTO documents (source, title, metadata, owner_id, created_at)
        VALUES ($1, $2, $3, $4, NOW())
@@ -78,14 +87,18 @@ export async function indexDocument(params: IndexParams): Promise<IndexResult> {
       const values: unknown[] = [];
 
       slice.forEach((chunk, j) => {
-        const base = j * 9;
+        const base = j * 10;
         const hasSpans = (chunk.metadata?.sensitiveSpans?.length ?? 0) > 0;
         // 仅对“含敏感区间”的切片加密落库：content 置 NULL、search_text 置空，
-        // 密文写入 content_enc；密钥仅在服务端，库内不留存明文 PII。
+        // 密文写入 content_enc（应用层 AES）与 content_pgp（pgcrypto 第二层）；
+        // 密钥仅在服务端，库内不留存明文 PII。
         const enc = hasKey && hasSpans ? encryptContent(chunk.content) : null;
+        const pgpExpr = hasKey && hasSpans
+          ? `pgp_sym_encrypt($${base + 10}, current_setting('app.content_key'))`
+          : 'NULL';
         placeholders.push(
           `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::vector, ` +
-          `$${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, NOW(), NOW())`,
+          `$${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, ${pgpExpr}, NOW(), NOW())`,
         );
         values.push(
           docId,
@@ -97,12 +110,13 @@ export async function indexDocument(params: IndexParams): Promise<IndexResult> {
           tags,
           source,
           enc,
+          chunk.content, // base+10：原始明文，供 pgcrypto 加密（即便 content 已置 NULL）
         );
       });
 
       const res = await client.query(
         `INSERT INTO chunks
-           (doc_id, content, search_text, hash, embedding, metadata, access_tags, source, content_enc, created_at, updated_at)
+           (doc_id, content, search_text, hash, embedding, metadata, access_tags, source, content_enc, content_pgp, created_at, updated_at)
          VALUES ${placeholders.join(', ')}
          ON CONFLICT (doc_id, hash) DO NOTHING`,
         values,

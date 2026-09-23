@@ -15,6 +15,7 @@
 | DB 层纵深 | chunks 表 `FOR SELECT` 行级安全（RLS），fail-closed | `DB_RLS_ENABLED` / `db/migrate.ts` |
 | 呈现脱敏 | `metadata.sensitiveSpans` 按标签在检索层遮盖为 `[已脱敏]` | `src/redact.ts` |
 | 落库加密 | 含敏感标记的切片 `content` 置 NULL、密文写入 `content_enc`（AES-256-GCM） | `CONTENT_ENCRYPTION_KEY` / `src/crypto.ts` |
+| 落库加密(库层) | 敏感切片并行写入 `content_pgp`（`pgcrypto` OpenPGP 密文），独立于应用层 AES；解密仅经 `app_pgp_decrypt()`，复用 RLS 会话变量做授权 | `pgcrypto` / `db/init.sql` |
 | 入库打标 | 上传标签 ∩ 主体许可，防提权 | `src/index.ts` 上传路由 |
 | 审计身份 | 由可信主体派生（superuser → 标签 → `key:sha256截断` → anonymous），不再信 `x-user-id` | `src/middleware/audit.ts` |
 | 离职回收 | `documents.owner_id` + `DELETE /admin/owners/:id/documents`（ON DELETE CASCADE） | `src/index.ts` |
@@ -122,6 +123,35 @@ SELECT count(*) FROM chunks;   -- = 0
 ```
 若 (d) 不为 0，说明 RLS 未生效（策略未建立或表未开启 RLS），需复查 4.1/4.2。
 
+### 4.3b pgcrypto 层验证（需 CONTENT_ENCRYPTION_KEY 已配置且已重新入库敏感文档）
+```sql
+-- (e) 函数与扩展已就绪
+SELECT extname FROM pg_extension WHERE extname = 'pgcrypto';          -- 期望 1 行
+SELECT proname FROM pg_proc WHERE proname = 'app_pgp_decrypt';        -- 期望 1 行
+
+-- (f) 存在敏感密文列（至少一条 content_pgp 非空）
+SELECT count(*) FROM chunks WHERE content_pgp IS NOT NULL;            -- ≥ 0
+
+-- (g) 未授权会话经函数解密必须返回 NULL（即便能 SELECT 该列）
+BEGIN;
+SELECT set_config('app.is_superuser', 'off', true),
+       set_config('app.current_tags', 'public', true),
+       set_config('app.content_key', '<与 CONTENT_ENCRYPTION_KEY 一致>', true);
+-- 选一条标记为 exec/confidential 的切片，其 content_pgp 经函数解密应得 NULL：
+SELECT app_pgp_decrypt(content_pgp, access_tags) AS d
+FROM chunks WHERE 'exec' = ANY(access_tags) LIMIT 1;                 -- 期望 d = NULL
+COMMIT;
+
+-- (h) 授权（超级用户）会话应得到明文
+BEGIN;
+SELECT set_config('app.is_superuser', 'on', true),
+       set_config('app.content_key', '<与 CONTENT_ENCRYPTION_KEY 一致>', true);
+SELECT app_pgp_decrypt(content_pgp, access_tags) AS d
+FROM chunks WHERE 'exec' = ANY(access_tags) LIMIT 1;                 -- 期望 d = 明文
+COMMIT;
+```
+若 (g) 非 NULL，说明函数授权判定异常；若 (h) 为 NULL，说明 `app.content_key` 与入库密钥不一致或 pgcrypto 未启用。
+
 ### 4.4 关闭 / 回滚
 ```bash
 # 关闭只需改 .env 并手动 DROP 策略，无需重建表：
@@ -150,9 +180,30 @@ psql $DATABASE_URL -c "ALTER TABLE chunks DISABLE ROW LEVEL SECURITY;"
 - 非敏感切片（无密文）不受影响。
 
 ### 5.3 库内明文边界
-- 敏感切片：`content=NULL`、`search_text=NULL`、`content_enc=密文` → 库内无明文 PII。
-- 非敏感切片：`content=明文`、`content_enc=NULL`。
-- 若需「即使应用进程被攻破也看不到明文」，启用第 4 节 RLS，并在 RLS 之上叠加 `pgcrypto` 列加密（见代码注释中的可选 RLS 段落）。
+- 敏感切片：`content=NULL`、`search_text=NULL`、`content_enc=密文(AES)`、`content_pgp=密文(pgcrypto)` → 库内无明文 PII，且存在**两层独立密文**。
+- 非敏感切片：`content=明文`、`content_enc=NULL`、`content_pgp=NULL`。
+- 检索读取（`src/retriever.ts`）优先用 `COALESCE(app_pgp_decrypt(c.content_pgp, c.access_tags), c.content) AS content`：
+  授权会话经 `app_pgp_decrypt()` 在 DB 内解密；密钥缺失 / 旧库 / 未启用 pgcrypto 时自动回落 Node 侧 `content_enc` 解密，**向后兼容**。
+
+### 5.4 pgcrypto 层（数据库层纵深）与威胁模型
+`content_pgp` 是叠在 RLS 之上的第二层加密，依赖 `pgcrypto` 扩展与 `app_pgp_decrypt()` 函数（`SECURITY DEFINER`）。该函数**复用 RLS 的同一组会话变量**做授权判定：
+
+| 会话状态 | `app_pgp_decrypt()` 返回 |
+|----------|--------------------------|
+| 超级用户（`app.is_superuser='on'`） | 解密明文 |
+| 标签交集命中（`row_tags && app.current_tags`） | 解密明文 |
+| 标签无交集且非超级用户 | `NULL`（拿不到明文） |
+| 未注入 `app.content_key`（密钥缺失） | `NULL`，交由上层 `content_enc` 解密 |
+
+**能防护 / 不能防护**（务必理解边界）：
+- ✅ 数据库**备份 / 逻辑导出 / 只读副本**：`content_pgp` 是密文，无 `app.content_key` 无法解密。
+- ✅ **直接 `SELECT content_pgp` 或绕过 RLS 直查**：函数返回 `NULL`，拿不到明文。
+- ✅ **SQL 注入类直接读库**：同理，未走函数授权即 `NULL`。
+- ⚠️ **应用进程被完全攻破**：应用本身持有 `CONTENT_ENCRYPTION_KEY`（env）并会注入 `app.content_key`，故能为授权用户解密。要彻底杜绝，需把密钥移出应用进程（见下）。
+- 若要求「即使应用被攻破也看不到明文」，应**将加密密钥仅存于数据库**（经密钥管理系统在 DB 侧 `SET LOCAL app.content_key` 注入，应用不再持有），并额外 `REVOKE SELECT (content_pgp) ON chunks FROM <应用角色>;` 强制所有读取都走 `app_pgp_decrypt()`。该强化属于更高级部署，按需启用。
+
+**密钥轮换**：`CONTENT_ENCRYPTION_KEY` 轮换后，旧 `content_pgp` 密文同样无法解密。因 `content_enc`（应用层 AES，同一密钥）并存，检索回落到 `content_enc` 仍可工作；若想两层都用新密钥，重新入库敏感文档即可（5.2）。
+
 
 ---
 
@@ -184,6 +235,7 @@ psql $DATABASE_URL -c "ALTER TABLE chunks DISABLE ROW LEVEL SECURITY;"
 - [ ] 生产环境 `NODE_ENV=production` 且未告警「API_KEY is not set」
 - [ ] `PRINCIPAL_TAGS` 已登记，低权限 Key 无法自报 `user_tags` 提权（上传裁剪生效）
 - [ ] 强合规场景已 `DB_RLS_ENABLED=true` 并完成 4.3 验证
+- [ ] 已 `CREATE EXTENSION pgcrypto`（迁移自动建），敏感文档重新入库后 `content_pgp` 非空（4.3b）
 - [ ] `CONTENT_ENCRYPTION_KEY` 存于密钥管理系统，未进版本库
 - [ ] 审计 `audit_log.user_id` 为可信主体派生值（非 `x-user-id`）
 - [ ] 已对数据库做迁移前备份
@@ -197,5 +249,6 @@ psql $DATABASE_URL -c "ALTER TABLE chunks DISABLE ROW LEVEL SECURITY;"
 | 检索返回空，但库内有数据 | RLS 已启用但会话变量未注入（代码非最新） | 确认部署的是含 `queryWithAccess` 的版本并重启 |
 | 所有 `chunks` 读取为 0 | RLS 启用但策略读取到空 `app.current_tags` | 见 4.3(d)；确认 `DB_RLS_ENABLED` 与代码版本匹配 |
 | 敏感切片检索报解密错误 | `CONTENT_ENCRYPTION_KEY` 与入库时不一致 / 已轮换 | 用入库时密钥，或重新入库敏感文档（5.2） |
+| 敏感切片 `content_pgp` 全为 NULL 但 `content_enc` 有值 | pgcrypto 未启用 / 入库时未配密钥 | `CREATE EXTENSION IF NOT EXISTS pgcrypto` 后重新入库敏感文档 |
 | admin 端点 503 | 未配 `ADMIN_API_KEY` | 配置后重启 |
 | 离职后其文档仍可被检索 | 未执行 owner 删除，或仅吊销 Key 但文档本就 `public` | 执行第 6 节删除；`public` 文档对所有主体可见属预期 |

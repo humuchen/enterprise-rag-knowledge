@@ -52,9 +52,12 @@ interface SparseRow {
   created_at: Date;
 }
 
-// 取切片明文：优先解密 content_enc（敏感切片库内存密文），否则回落 content（明文/旧库）。
+// 取切片明文：优先用 SQL 侧 app_pgp_decrypt 已解密的 content
+// （数据库层授权解密，未授权会话返回 NULL）；若为空（旧库 / 未启用 pgcrypto /
+// 当前环境无密钥），回落 Node 侧 content_enc 解密，保证向后兼容。
 function plainContent(row: DenseRow | SparseRow): string {
-  return decryptContent(row.content_enc, row.content ?? undefined);
+  if (row.content) return row.content;
+  return decryptContent(row.content_enc, undefined);
 }
 
 // 服务端强制过滤子句：让 chunks_access_tags_idx(GIN) 真正参与召回，
@@ -76,7 +79,9 @@ async function denseRetrieve(
   const { sql, param } = accessFilterSql(allowedTags, isSuperuser);
 
   const rows = await queryWithAccess<DenseRow>(
-    `SELECT c.id, c.doc_id, c.content, c.content_enc, c.metadata, c.access_tags,
+    `SELECT c.id, c.doc_id,
+            COALESCE(app_pgp_decrypt(c.content_pgp, c.access_tags), c.content) AS content,
+            c.content_enc, c.metadata, c.access_tags,
             1 - (c.embedding <=> $1::vector) AS similarity,
             d.source, d.title, d.created_at
      FROM chunks c
@@ -106,7 +111,9 @@ async function sparseRetrieve(
 
   const { sql, param } = accessFilterSql(allowedTags, isSuperuser);
   const rows = await queryWithAccess<SparseRow>(
-    `SELECT c.id, c.doc_id, c.content, c.content_enc, c.metadata, c.access_tags,
+    `SELECT c.id, c.doc_id,
+            COALESCE(app_pgp_decrypt(c.content_pgp, c.access_tags), c.content) AS content,
+            c.content_enc, c.metadata, c.access_tags,
             ts_rank_cd(fts.tsv, q.query) AS rank,
             d.source, d.title, d.created_at
      FROM chunks c
