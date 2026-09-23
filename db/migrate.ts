@@ -1,5 +1,6 @@
 // db/migrate.ts
 import { pool, redis } from '../src/db';
+import { config } from '../src/config';
 import { readFileSync } from 'fs';
 import path from 'path';
 
@@ -113,6 +114,32 @@ async function applySchemaUpgrades(): Promise<void> {
       `请执行 "npm run ingest -- --reindex --backfill-text" 回填。`,
     );
   }
+
+  // 8. 受控启用数据库层行级安全（RLS）。仅当 DB_RLS_ENABLED=true 时建立，
+  //    否则保持关闭（应用层 access_tags 过滤已提供主防护）。
+  await applyRlsPolicy();
+}
+
+// 在 chunks 表建立 FOR SELECT 的 RLS 策略。读取路径（retriever）会在事务内
+// 通过 set_config 注入会话变量 app.current_tags / app.is_superuser；策略据此判定可见性。
+// 写操作（INSERT/UPDATE/DELETE，含 owner 回收的级联删除）不受 SELECT 策略影响。
+async function applyRlsPolicy(): Promise<void> {
+  if (!config.DB_RLS_ENABLED) {
+    console.log('[RLS] disabled (DB_RLS_ENABLED=false) — skipping policy creation');
+    return;
+  }
+
+  await pool.query(`ALTER TABLE chunks ENABLE ROW LEVEL SECURITY`);
+  await pool.query(`DROP POLICY IF EXISTS chunks_principal_select ON chunks`);
+  await pool.query(`
+    CREATE POLICY chunks_principal_select ON chunks
+      FOR SELECT
+      USING (
+        current_setting('app.is_superuser', 'off') = 'on'
+        OR access_tags && string_to_array(current_setting('app.current_tags', ''), ',')
+      )
+  `);
+  console.log('[RLS] enabled on chunks: FOR SELECT policy chunks_principal_select');
 }
 
 async function runMigration(): Promise<void> {

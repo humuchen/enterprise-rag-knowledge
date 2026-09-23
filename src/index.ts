@@ -3,7 +3,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import { config } from './config';
-import { pool, redis, closeConnections } from './db';
+import { pool, redis, closeConnections, queryAsAdmin } from './db';
 import { HybridRetriever, QueryContext } from './retriever';
 import { LLMClient } from './generator';
 import { chunkDocument } from './chunker';
@@ -11,6 +11,8 @@ import { parseDocument } from './parsers';
 import { indexDocument } from './indexer';
 import { auditLogger, recordChatTurn } from './middleware/audit';
 import { checkRateLimit, rateLimitIdentity } from './ratelimit';
+import { resolvePrincipalTags, principalAuditId } from './principal';
+import type { Principal } from './principal';
 import { writeFile, unlink } from 'fs/promises';
 import { join, extname } from 'path';
 import { tmpdir } from 'os';
@@ -19,6 +21,7 @@ import { randomUUID } from 'crypto';
 declare module 'fastify' {
   interface FastifyRequest {
     retrievedIds?: string[];
+    principal?: Principal;
   }
 }
 
@@ -69,6 +72,9 @@ fastify.register(multipart, {
 fastify.addHook('onRequest', async (request, reply) => {
   const path = (request.raw.url ?? '').split('?')[0];
   if (path === '/health') return;
+
+  // 在服务端解析可信主体，挂到 request 供审计与检索使用（不信任客户端自报身份）。
+  request.principal = resolvePrincipalTags(request.headers['x-api-key'] as string | undefined);
 
   if (path.startsWith(ADMIN_PREFIX)) {
     if (!config.ADMIN_API_KEY) {
@@ -156,8 +162,11 @@ fastify.post('/api/v1/chat', async (request, reply) => {
   }
 
   const sessionId = body.session_id || randomUUID();
+  // 权限以服务端解析的主体为准，不再信任客户端自报的 user_tags
+  const principal = resolvePrincipalTags(request.headers['x-api-key'] as string | undefined);
   const ctx: QueryContext = {
-    userTags: body.user_tags ?? [],
+    userTags: principal.tags,
+    isSuperuser: principal.isSuperuser,
     sessionId,
     history: body.history ?? [],
     language: 'auto',
@@ -210,8 +219,10 @@ fastify.post('/api/v1/chat/stream', async (request, reply) => {
   }
 
   const sessionId = body.session_id || randomUUID();
+  const principal = resolvePrincipalTags(request.headers['x-api-key'] as string | undefined);
   const ctx: QueryContext = {
-    userTags: body.user_tags ?? [],
+    userTags: principal.tags,
+    isSuperuser: principal.isSuperuser,
     sessionId,
     history: body.history ?? [],
     language: 'auto',
@@ -340,13 +351,26 @@ fastify.post('/api/v1/documents', async (request, reply) => {
       { language: lang, original_filename: fileName },
     );
 
+    // 服务端主体绑定：上传文档的 access_tags 不得超过该主体被许可的范围，
+    // 防止低权限用户通过打标提权（如自标 'exec' 把文档藏起来或越权共享）。
+    const uploadPrincipal = resolvePrincipalTags(request.headers['x-api-key'] as string | undefined);
+    const requestedTags = accessTags ?? ['public'];
+    const effectiveTags = uploadPrincipal.isSuperuser
+      ? requestedTags
+      : requestedTags.filter((t) => uploadPrincipal.tags.includes(t));
+    const uploadTags = effectiveTags.length ? effectiveTags : ['public'];
+
     const result = await indexDocument({
       source: fileName,
       title: title ?? fileName,
       language: lang,
       metadata: { original_filename: fileName },
       chunks,
-      accessTags: accessTags ?? ['public'],
+      accessTags: uploadTags,
+      ownerId: principalAuditId(
+        uploadPrincipal,
+        request.headers['x-api-key'] as string | undefined,
+      ),
     });
 
     return reply.status(201).send({
@@ -372,7 +396,7 @@ fastify.post('/api/v1/documents', async (request, reply) => {
 fastify.get('/api/v1/documents/:doc_id', async (request, reply) => {
   const { doc_id } = request.params as { doc_id: string };
 
-  const doc = await pool.query<{
+  const doc = await queryAsAdmin<{
     id: string;
     source: string;
     title: string | null;
@@ -383,22 +407,26 @@ fastify.get('/api/v1/documents/:doc_id', async (request, reply) => {
     [doc_id],
   );
 
-  if (!doc.rows[0]) {
+  if (!doc[0]) {
     return reply.status(404).send({ error: 'Document not found' });
   }
 
-  const chunkCount = await pool.query<{ count: string }>(
+  const chunkCount = await queryAsAdmin<{ count: string }>(
     `SELECT COUNT(*) FROM chunks WHERE doc_id = $1`,
     [doc_id],
   );
 
+  // 不向调用方暴露敏感 span 偏移（避免泄露“哪里有敏感内容”）
+  const safeMetadata = { ...(doc[0].metadata ?? {}) } as Record<string, unknown>;
+  delete safeMetadata.sensitiveSpans;
+
   return {
-    id: doc.rows[0].id,
-    source: doc.rows[0].source,
-    title: doc.rows[0].title,
-    metadata: doc.rows[0].metadata,
-    chunk_count: parseInt(chunkCount.rows[0].count),
-    created_at: doc.rows[0].created_at,
+    id: doc[0].id,
+    source: doc[0].source,
+    title: doc[0].title,
+    metadata: safeMetadata,
+    chunk_count: parseInt(chunkCount[0].count),
+    created_at: doc[0].created_at,
   };
 });
 
@@ -406,9 +434,9 @@ fastify.get('/api/v1/documents/:doc_id', async (request, reply) => {
 fastify.delete('/api/v1/documents/:doc_id', async (request, reply) => {
   const { doc_id } = request.params as { doc_id: string };
 
-  const result = await pool.query('DELETE FROM documents WHERE id = $1 RETURNING id', [doc_id]);
+  const result = await queryAsAdmin('DELETE FROM documents WHERE id = $1 RETURNING id', [doc_id]);
 
-  if (result.rowCount === 0) {
+  if (result.length === 0) {
     return reply.status(404).send({ error: 'Document not found' });
   }
 
@@ -418,13 +446,34 @@ fastify.delete('/api/v1/documents/:doc_id', async (request, reply) => {
 
 // Admin metrics
 fastify.get('/api/v1/admin/metrics', async () => {
-  const chunkCount = await pool.query<{ count: string }>('SELECT COUNT(*) FROM chunks');
-  const docCount = await pool.query<{ count: string }>('SELECT COUNT(*) FROM documents');
+  const chunkCount = await queryAsAdmin<{ count: string }>('SELECT COUNT(*) FROM chunks');
+  const docCount = await queryAsAdmin<{ count: string }>('SELECT COUNT(*) FROM documents');
 
   return {
-    documents_total: parseInt(docCount.rows[0].count),
-    chunks_total: parseInt(chunkCount.rows[0].count),
+    documents_total: parseInt(docCount[0].count),
+    chunks_total: parseInt(chunkCount[0].count),
     uptime: process.uptime(),
+  };
+});
+
+// 离职回收：按主体删除其名下全部文档（ON DELETE CASCADE 自动清理对应切片与向量）。
+// 注意：仅删除“数据”，不重算任何向量。同时应在 .env 的 PRINCIPAL_TAGS 中移除其 Key 以吊销访问。
+fastify.delete('/api/v1/admin/owners/:owner_id/documents', async (request, reply) => {
+  const { owner_id } = request.params as { owner_id: string };
+  if (!owner_id?.trim()) {
+    return reply.status(400).send({ error: 'owner_id is required' });
+  }
+
+  const res = await queryAsAdmin(
+    'DELETE FROM documents WHERE owner_id = $1 RETURNING id',
+    [owner_id],
+  );
+
+  console.log(`Offboarded owner ${owner_id}: deleted ${res.length} documents`);
+  return {
+    status: 'deleted',
+    owner_id,
+    documents_deleted: res.length,
   };
 });
 

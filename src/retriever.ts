@@ -1,11 +1,14 @@
 // src/retriever.ts
-import { query, vectorJson } from './db';
+import { queryWithAccess, vectorJson } from './db';
 import { config } from './config';
 import { embedTexts, rerank } from './embeddings';
 import { buildSearchText } from './tokenize';
+import { redactContent } from './redact';
+import { decryptContent } from './crypto';
 
 export interface QueryContext {
   userTags: string[];
+  isSuperuser?: boolean;
   sessionId: string;
   history: Array<{ role: string; content: string }>;
   language: 'auto' | 'zh' | 'en';
@@ -26,7 +29,8 @@ export interface SearchResult {
 interface DenseRow {
   id: string;
   doc_id: string;
-  content: string;
+  content: string | null;
+  content_enc: string | null;
   metadata: Record<string, any>;
   access_tags: string[];
   similarity: number;
@@ -38,7 +42,8 @@ interface DenseRow {
 interface SparseRow {
   id: string;
   doc_id: string;
-  content: string;
+  content: string | null;
+  content_enc: string | null;
   metadata: Record<string, any>;
   access_tags: string[];
   rank: number;
@@ -47,23 +52,41 @@ interface SparseRow {
   created_at: Date;
 }
 
+// 取切片明文：优先解密 content_enc（敏感切片库内存密文），否则回落 content（明文/旧库）。
+function plainContent(row: DenseRow | SparseRow): string {
+  return decryptContent(row.content_enc, row.content ?? undefined);
+}
+
+// 服务端强制过滤子句：让 chunks_access_tags_idx(GIN) 真正参与召回，
+// 而非仅依赖检索后内存过滤。超级用户跳过；空标签集等价于仅 'public'。
+function accessFilterSql(allowedTags: string[], isSuperuser: boolean): { sql: string; param: string[] } {
+  if (isSuperuser) return { sql: '', param: [] };
+  const tags = allowedTags.length ? allowedTags : ['public'];
+  return { sql: 'AND c.access_tags && $3::text[]', param: tags };
+}
+
 // Dense retrieval via pgvector
 async function denseRetrieve(
   queryVector: number[],
   topK: number,
+  allowedTags: string[],
+  isSuperuser: boolean,
 ): Promise<DenseRow[]> {
   const vecStr = vectorJson(queryVector);
+  const { sql, param } = accessFilterSql(allowedTags, isSuperuser);
 
-  const rows = await query<DenseRow>(
-    `SELECT c.id, c.doc_id, c.content, c.metadata, c.access_tags,
+  const rows = await queryWithAccess<DenseRow>(
+    `SELECT c.id, c.doc_id, c.content, c.content_enc, c.metadata, c.access_tags,
             1 - (c.embedding <=> $1::vector) AS similarity,
             d.source, d.title, d.created_at
      FROM chunks c
      JOIN documents d ON c.doc_id = d.id
-     WHERE c.embedding IS NOT NULL
+     WHERE c.embedding IS NOT NULL ${sql}
      ORDER BY c.embedding <=> $1::vector
      LIMIT $2`,
-    [vecStr, topK],
+    [vecStr, topK, ...param],
+    allowedTags,
+    isSuperuser,
   );
 
   return rows;
@@ -75,22 +98,27 @@ async function denseRetrieve(
 async function sparseRetrieve(
   queryText: string,
   topK: number,
+  allowedTags: string[],
+  isSuperuser: boolean,
 ): Promise<SparseRow[]> {
   const expanded = buildSearchText(queryText).trim();
   if (!expanded) return [];
 
-  const rows = await query<SparseRow>(
-    `SELECT c.id, c.doc_id, c.content, c.metadata, c.access_tags,
+  const { sql, param } = accessFilterSql(allowedTags, isSuperuser);
+  const rows = await queryWithAccess<SparseRow>(
+    `SELECT c.id, c.doc_id, c.content, c.content_enc, c.metadata, c.access_tags,
             ts_rank_cd(fts.tsv, q.query) AS rank,
             d.source, d.title, d.created_at
      FROM chunks c
      JOIN documents d ON c.doc_id = d.id
      CROSS JOIN LATERAL to_tsvector('simple', coalesce(c.search_text, '')) AS fts(tsv)
      CROSS JOIN LATERAL plainto_tsquery('simple', $1) AS q(query)
-     WHERE fts.tsv @@ q.query
+     WHERE fts.tsv @@ q.query ${sql}
      ORDER BY rank DESC
      LIMIT $2`,
-    [expanded, topK],
+    [expanded, topK, ...param],
+    allowedTags,
+    isSuperuser,
   );
 
   return rows;
@@ -129,7 +157,10 @@ function reciprocalRankFusion(
 function applyAccessFilter(
   results: Array<{ item: DenseRow | SparseRow; fusedScore: number }>,
   userTags: string[],
+  isSuperuser: boolean,
 ): Array<{ item: DenseRow | SparseRow; fusedScore: number }> {
+  // 超级用户（管理员 Key）跳过标签过滤，但仍走呈现层遮盖逻辑由调用方决定可见性
+  if (isSuperuser) return results;
   if (!userTags.length) {
     return results.filter(r => (r.item.access_tags ?? []).includes('public'));
   }
@@ -148,17 +179,17 @@ export class HybridRetriever {
     const queryEmbedding = await embedTexts([queryText]);
     const queryVector = queryEmbedding[0];
 
-    // 2. Parallel dense + sparse retrieval
+    // 2. Parallel dense + sparse retrieval（SQL 层已按主体标签强制过滤）
     const [dense, sparse] = await Promise.all([
-      denseRetrieve(queryVector, topK),
-      sparseRetrieve(queryText, topK),
+      denseRetrieve(queryVector, topK, ctx.userTags, ctx.isSuperuser ?? false),
+      sparseRetrieve(queryText, topK, ctx.userTags, ctx.isSuperuser ?? false),
     ]);
 
     // 3. RRF fusion
     const fused = reciprocalRankFusion(dense, sparse);
 
     // 4. Access control
-    const filtered = applyAccessFilter(fused, ctx.userTags);
+    const filtered = applyAccessFilter(fused, ctx.userTags, ctx.isSuperuser ?? false);
 
     // 5. Rerank
     const topCandidates = filtered.slice(0, topK);
@@ -167,7 +198,10 @@ export class HybridRetriever {
       return [];
     }
 
-    const passages = topCandidates.map(r => r.item.content);
+    // 呈现层遮盖：重排输入即先按权限遮盖敏感 span，避免越权文本进入评分与上下文
+    const passages = topCandidates.map(r =>
+      redactContent(plainContent(r.item), r.item.metadata?.sensitiveSpans, ctx.userTags, ctx.isSuperuser ?? false),
+    );
     const reranked = await rerank(queryText, passages, config.TOP_K_RERANK);
 
     // 6. Format results（丢弃低于阈值的重排结果，避免低分噪声进入上下文）
@@ -177,9 +211,15 @@ export class HybridRetriever {
       const candidate = topCandidates[originalIndex];
       if (!candidate) continue;
       const item = candidate.item;
+      const displayContent = redactContent(
+        plainContent(item),
+        item.metadata?.sensitiveSpans,
+        ctx.userTags,
+        ctx.isSuperuser ?? false,
+      );
       result.push({
         chunkId: item.id,
-        content: item.content,
+        content: displayContent,
         source: item.source ?? 'unknown',
         score,
         metadata: item.metadata ?? {},

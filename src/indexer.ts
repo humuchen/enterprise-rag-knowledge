@@ -10,6 +10,8 @@
 import { pool, VECTOR_DIMS } from './db';
 import { embedTexts } from './embeddings';
 import { buildSearchText } from './tokenize';
+import { encryptContent, decryptContent } from './crypto';
+import { config } from './config';
 import type { ChunkDict } from './chunker';
 
 const INSERT_BATCH = 100;
@@ -21,6 +23,7 @@ export interface IndexParams {
   metadata?: Record<string, any>;
   chunks: ChunkDict[];
   accessTags: string[];
+  ownerId?: string;
 }
 
 export interface IndexResult {
@@ -34,7 +37,7 @@ function toVectorLiteral(emb: number[]): string {
 }
 
 export async function indexDocument(params: IndexParams): Promise<IndexResult> {
-  const { source, title, language, metadata, chunks, accessTags } = params;
+  const { source, title, language, metadata, chunks, accessTags, ownerId } = params;
 
   if (!chunks.length) {
     throw new Error('No chunks produced after splitting');
@@ -48,16 +51,22 @@ export async function indexDocument(params: IndexParams): Promise<IndexResult> {
   }
 
   const tags = accessTags.length ? accessTags : ['public'];
+  const hasKey = Boolean(config.CONTENT_ENCRYPTION_KEY?.trim());
   const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
 
     const docRes = await client.query<{ id: string }>(
-      `INSERT INTO documents (source, title, metadata, created_at)
-       VALUES ($1, $2, $3, NOW())
+      `INSERT INTO documents (source, title, metadata, owner_id, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
        RETURNING id`,
-      [source, title, JSON.stringify({ language: language ?? 'unknown', ...(metadata ?? {}) })],
+      [
+        source,
+        title,
+        JSON.stringify({ language: language ?? 'unknown', ...(metadata ?? {}) }),
+        ownerId ?? null,
+      ],
     );
 
     const docId = docRes.rows[0].id;
@@ -69,26 +78,31 @@ export async function indexDocument(params: IndexParams): Promise<IndexResult> {
       const values: unknown[] = [];
 
       slice.forEach((chunk, j) => {
-        const base = j * 8;
+        const base = j * 9;
+        const hasSpans = (chunk.metadata?.sensitiveSpans?.length ?? 0) > 0;
+        // 仅对“含敏感区间”的切片加密落库：content 置 NULL、search_text 置空，
+        // 密文写入 content_enc；密钥仅在服务端，库内不留存明文 PII。
+        const enc = hasKey && hasSpans ? encryptContent(chunk.content) : null;
         placeholders.push(
           `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}::vector, ` +
-          `$${base + 6}, $${base + 7}, $${base + 8}, NOW(), NOW())`,
+          `$${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, NOW(), NOW())`,
         );
         values.push(
           docId,
-          chunk.content,
-          chunk.searchText,
+          enc ? null : chunk.content,
+          hasSpans ? null : chunk.searchText,
           chunk.hash,
           toVectorLiteral(embeddings[offset + j]),
           JSON.stringify(chunk.metadata ?? {}),
           tags,
           source,
+          enc,
         );
       });
 
       const res = await client.query(
         `INSERT INTO chunks
-           (doc_id, content, search_text, hash, embedding, metadata, access_tags, source, created_at, updated_at)
+           (doc_id, content, search_text, hash, embedding, metadata, access_tags, source, content_enc, created_at, updated_at)
          VALUES ${placeholders.join(', ')}
          ON CONFLICT (doc_id, hash) DO NOTHING`,
         values,
@@ -113,9 +127,12 @@ export async function indexDocument(params: IndexParams): Promise<IndexResult> {
 }
 
 // 为存量 chunk 回填 search_text（升级到 1.1.0 后，中文检索依赖该列）。
+// 含敏感区间的切片 search_text 始终为空（避免 PII token 落库），此处跳过。
 export async function backfillSearchText(): Promise<number> {
-  const { rows } = await pool.query<{ id: string; content: string }>(
-    'SELECT id, content FROM chunks WHERE search_text IS NULL',
+  const { rows } = await pool.query<{ id: string; content: string | null; content_enc: string | null }>(
+    `SELECT id, content, content_enc FROM chunks
+     WHERE search_text IS NULL
+       AND (metadata->'sensitiveSpans' IS NULL OR jsonb_array_length(metadata->'sensitiveSpans') = 0)`,
   );
 
   let processed = 0;
@@ -125,8 +142,9 @@ export async function backfillSearchText(): Promise<number> {
     const values: unknown[] = [];
 
     slice.forEach((row, j) => {
+      const plain = decryptContent(row.content_enc, row.content ?? undefined);
       placeholders.push(`($${j * 2 + 1}::uuid, $${j * 2 + 2})`);
-      values.push(row.id, buildSearchText(row.content));
+      values.push(row.id, buildSearchText(plain));
     });
 
     await pool.query(
@@ -145,15 +163,18 @@ export async function backfillSearchText(): Promise<number> {
 }
 
 // 重算全库向量（换嵌入模型后使用）。同样按批更新，避免逐条往返。
+// 敏感切片 content 为 NULL、密文在 content_enc，需解密后再向量化。
 export async function reindexAllEmbeddings(): Promise<number> {
-  const { rows } = await pool.query<{ id: string; content: string }>(
-    'SELECT id, content FROM chunks WHERE content IS NOT NULL ORDER BY created_at',
+  const { rows } = await pool.query<{ id: string; content: string | null; content_enc: string | null }>(
+    'SELECT id, content, content_enc FROM chunks ORDER BY created_at',
   );
 
   let processed = 0;
   for (let i = 0; i < rows.length; i += INSERT_BATCH) {
     const slice = rows.slice(i, i + INSERT_BATCH);
-    const embeddings = await embedTexts(slice.map(r => r.content));
+    const embeddings = await embedTexts(
+      slice.map(r => decryptContent(r.content_enc, r.content ?? undefined)),
+    );
 
     const placeholders: string[] = [];
     const values: unknown[] = [];

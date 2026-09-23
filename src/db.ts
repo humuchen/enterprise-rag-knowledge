@@ -28,6 +28,39 @@ export const one = async <T = any>(text: string, params?: any[]): Promise<T | nu
   return (res.rows?.[0] as T) ?? null;
 };
 
+// 在受控事务内执行查询，并注入 RLS 会话变量。
+// 会话变量用 set_config(..., true)（事务级本地），不会泄漏到连接池的其它请求。
+// allowedTags 为空且非超级用户时回落 'public'，与应用层 accessFilterSql 语义一致。
+// RLS 策略关闭时这些变量不会被任何策略读取，行为完全等价普通查询。
+export const queryWithAccess = async <T = any>(
+  text: string,
+  params: any[] = [],
+  allowedTags: string[] = [],
+  isSuperuser = false,
+): Promise<T[]> => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const tags = isSuperuser ? '' : (allowedTags.length ? allowedTags : ['public']).join(',');
+    await client.query(
+      "SELECT set_config('app.current_tags', $1, true), set_config('app.is_superuser', $2, true)",
+      [tags, isSuperuser ? 'on' : 'off'],
+    );
+    const res = await client.query(text, params);
+    await client.query('COMMIT');
+    return res.rows as T[];
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw e;
+  } finally {
+    client.release();
+  }
+};
+
+// 管理员/运维上下文：以超级用户身份执行，绕过 chunks 表的 RLS SELECT 策略。
+export const queryAsAdmin = <T = any>(text: string, params: any[] = []): Promise<T[]> =>
+  queryWithAccess<T>(text, params, [], true);
+
 export const vectorJson = (vec: number[]): string =>
   `[${vec.map(v => parseFloat(v.toFixed(6))).join(',')}]`;
 

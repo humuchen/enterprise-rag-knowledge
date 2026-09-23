@@ -2,6 +2,7 @@
 import { readFile } from 'fs/promises';
 import path from 'path';
 import { spawn } from 'child_process';
+import type { SensitiveSpan } from './redact';
 
 // Simple language detection
 export function detectLanguage(text: string): 'zh' | 'en' | 'unknown' {
@@ -11,7 +12,7 @@ export function detectLanguage(text: string): 'zh' | 'en' | 'unknown' {
   return cjk / total > 0.1 ? 'zh' : 'en';
 }
 
-// PII scrubbing
+// PII scrubbing（删除式：入库即改写原文，默认关闭）
 const PII_PATTERNS: [RegExp, string][] = [
   [/\b\d{3}-\d{2}-\d{4}\b/g, '[SSN]'],
   [/\b\d{16,19}\b/g, '[CARD]'],
@@ -24,6 +25,30 @@ export function scrubPii(text: string): string {
     text = text.replace(pattern, replacement);
   }
   return text;
+}
+
+// 敏感内容检测（标记式）：返回相对当前文本的偏移，供切片后按块遮盖。
+// 与 scrubPii 不同——这里只“标记”不“删除”，原文保留，由检索层按权限呈现。
+// requiredTags 表示该 span 需持有的 access_tags 才能查看原文（如高管标签 'exec'）。
+const PII_DETECT: Array<[RegExp, string, string[]]> = [
+  [/\b\d{3}-\d{2}-\d{4}\b/g, 'ssn', ['exec']],
+  [/\b\d{16,19}\b/g, 'card', ['exec']],
+  [/\b[\w.+-]+@[\w.-]+\.\w{2,}\b/g, 'email', ['exec']],
+  [/\b\d{3}-\d{4}-\d{4}\b/g, 'phone', ['exec']],
+  [/\b1[3-9]\d{9}\b/g, 'phone_cn', ['exec']],
+];
+
+export function detectSensitiveSpans(text: string): SensitiveSpan[] {
+  const spans: SensitiveSpan[] = [];
+  for (const [pattern, level, tags] of PII_DETECT) {
+    pattern.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = pattern.exec(text)) !== null) {
+      spans.push({ start: m.index, end: m.index + m[0].length, level, requiredTags: tags });
+      if (m.index === pattern.lastIndex) pattern.lastIndex++;
+    }
+  }
+  return spans;
 }
 
 // PDF parser

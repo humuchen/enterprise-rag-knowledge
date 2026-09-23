@@ -1,6 +1,7 @@
 // src/chunker.ts
 import crypto from 'crypto';
 import { buildSearchText } from './tokenize';
+import { detectSensitiveSpans } from './parsers';
 
 const SEPARATORS: Array<{ pattern: RegExp; label: string }> = [
   { pattern: /^#{1,6}\s/m, label: 'header' },
@@ -129,13 +130,15 @@ export function chunkDocument(
     const h = computeHash(chunkText);
     if (seen.has(h)) continue;
     seen.add(h);
+    // 标记敏感区间，随切片落库到 metadata.sensitiveSpans，检索时按权限遮盖。
+    const sensitiveSpans = detectSensitiveSpans(chunkText);
     result.push({
       content: chunkText,
       searchText: buildSearchText(chunkText),
       hash: h,
       source,
       title: title || source,
-      metadata: metadata ?? {},
+      metadata: { ...(metadata ?? {}), sensitiveSpans },
     });
   }
 

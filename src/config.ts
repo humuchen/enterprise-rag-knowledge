@@ -41,6 +41,39 @@ const ConfigSchema = z.object({
   API_KEY: z.string().default(''),
   ADMIN_API_KEY: z.string().default(''),
 
+  // 服务端主体绑定：API Key -> 可访问标签集（JSON 字符串）。
+  // 取代客户端自报的 user_tags，使权限判断有可信身份锚点。
+  // 例：{"k_employee":"public","k_hr":"public,hr","k_exec":"public,hr,exec,confidential"}
+  PRINCIPAL_TAGS: z.string().default('{}').transform((s): Record<string, string[]> => {
+    try {
+      const parsed = JSON.parse(s);
+      return typeof parsed === 'object' && parsed ? parsed : {};
+    } catch {
+      return {};
+    }
+  }),
+
+  // 未登记 Key（仅匹配 API_KEY）时的默认标签集，逗号分隔。
+  DEFAULT_USER_TAGS: z.string().default('public').transform((s) =>
+    s.split(',').map((x) => x.trim()).filter(Boolean),
+  ),
+
+  // 主体可读标签（用于审计落库的人类可读身份，与 PRINCIPAL_TAGS 的 Key 对应）。
+  // 例：{"k_employee":"员工","k_hr":"人事","k_exec":"高管"}
+  PRINCIPAL_LABELS: z.string().default('{}').transform((s): Record<string, string> => {
+    try {
+      const parsed = JSON.parse(s);
+      return typeof parsed === 'object' && parsed ? parsed : {};
+    } catch {
+      return {};
+    }
+  }),
+
+  // 落库内容加密密钥（AES-256-GCM）。缺省为空 -> 不加密（明文落库，仅开发用）。
+  // 生产务必配置 64 位 hex / 32 字节 base64 / 任意口令；密钥仅存服务端，绝不入库。
+  // 仅含 sensitiveSpans 的敏感切片会加密 content、并将其 search_text 置空。
+  CONTENT_ENCRYPTION_KEY: z.string().default(''),
+
   // CORS。逗号分隔的白名单；'*' 表示反射任意来源（此时会关闭 credentials）。
   CORS_ORIGIN: z.string().default('*'),
 
@@ -50,6 +83,12 @@ const ConfigSchema = z.object({
 
   AUDIT_ENABLED: boolFromEnv(true),
   CHAT_HISTORY_ENABLED: boolFromEnv(true),
+
+  // 是否启用数据库层行级安全（RLS）。默认关闭；开启后 migrate 会在 chunks 表建立
+  // FOR SELECT 策略，读取路径（retriever）会注入会话变量 app.current_tags /
+  // app.is_superuser，形成与应用层 `access_tags && $tags` 过滤互补的 DB 层纵深防御。
+  // RLS 为 fail-closed：未注入会话变量时所有读取被策略拒绝。
+  DB_RLS_ENABLED: boolFromEnv(false),
 });
 
 export const config = ConfigSchema.parse(process.env);
